@@ -1,8 +1,8 @@
 {
   "name": "dsh-progress-osd",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "把 DSH 会话进度用 DeepSeek 概括成一句中文，推到 customshell 顶栏 OSD 与桌面通知（notify-send）",
+  "description": "把 DSH 会话的模型思考（reasoning）实时推到 customshell 顶栏 OSD：零联网、零 API 成本",
   "type": "module",
   "main": "dist/index.js",
   "exports": {
@@ -29,7 +29,7 @@
     "dsh-plugin",
     "osd",
     "progress",
-    "notify-send",
+    "reasoning",
     "niri"
   ],
   "license": "MIT",

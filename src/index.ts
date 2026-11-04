@@ -1,35 +1,33 @@
 /**
- * dsh-progress-osd — 监听 DSH 会话进度，用 DeepSeek 概括成一句中文，推到桌面。
+ * dsh-progress-osd — 把 DSH 会话的「思考内容」直接推到桌面，零联网、零 API 成本。
  *
- * 两条出口：
+ * 出口：
  *   1. 顶栏 OSD：按 `~/customshell-arch-config/dsh/OSD-PROTOCOL.md` 写
  *      `~/.cache/dsh-osd.json`（customshell 的 DshOsdState.qml 每 500ms 读一次）。
- *   2. 桌面通知：`notify-send`（niri + mako）。
+ *   2. 桌面通知：`notify-send`（默认关闭，见 config.notify）。
  *
- * 事件来源（cordis，scoped 事件需要 { global: true }）：
- *   session/event  (session, event)  event.type: turn/start | step/start | step/end
- *                                    | tool/call | tool/result | todo/write
- *                                    | assistant/message | turn/end
- *   agent/status   { agent, status: 'idle' | 'running' }
+ * 思考文本从哪来 —— DSH 没有单独的「思考事件」，reasoning 挂在模型消息事件的
+ * stream 数组里（`@deepseek-ai/dsh-llm/lib/types/assistant-stream.d.ts`）：
+ *   session/event  event.type = 'assistant/message' | 'assistant/attempt'
+ *                  event.data.stream[] 里 type === 'reasoning-chunks' 的 texts 拼接
+ *   （没有 reasoning 时按 config.fallbackToText 回退到 'text-chunks'）
  *
- * 成本控制：
- *   - 两次概括之间至少 debounceMs（默认 5s）的静默期，期间事件只更新快照；
- *   - turn/end 强制立即概括一次；
- *   - System Prompt 是常量、内容里没有任何变量，配合 DeepSeek 的自动前缀缓存；
- *   - max_tokens 100，temperature 0，AbortController 硬超时；
- *   - 没有 DEEPSEEK_API_KEY / 请求失败 / 超时 → 本地规则兜底文本，照样推送。
+ * 其它监听的事件（用于即时进度，纯本地拼装，不发网络请求）：
+ *   turn/start | turn/end | step/start | tool/call | tool/result | todo/write
+ *   agent/status { status: 'idle' | 'running' }  —— 兜底收尾
+ *
+ * 防抖：思考是连续吐字的，不能每来一段就弹一次。这里用 trailing debounce ——
+ * 每来新思考就重置计时器，静默满 thoughtDebounceMs（默认 4s）才把最新一条推出去。
  *
  * 环境变量（都可选）：
- *   DEEPSEEK_API_KEY       DeepSeek 密钥（唯一必需项，没有则只用兜底文本）
- *   DEEPSEEK_BASE_URL     默认 https://api.deepseek.com
- *   DSH_OSD_MODEL         默认 deepseek-chat
- *   DSH_OSD_DEBOUNCE_MS   默认 5000
- *   DSH_OSD_NOTIFY        默认 1；0 关闭桌面通知
- *   DSH_OSD_NOTIFY_LIVE   默认 0；1 表示运行中也弹通知（受 minNotifyGapMs 限制）
- *   DSH_OSD_KEY           OSD 里用的任务 id，默认 `dsh-<pid>`
- *   DSH_OSD_FILE          默认 ~/.cache/dsh-osd.json
- *   DSH_OSD_POLL_URL      可选。事件流拿不到进度时轮询的 URL，默认
- *                           http://127.0.0.1:3080/agent-status/api/state（探测不通自动停）
+ *   DSH_OSD_DEBOUNCE_MS  思考停顿多久才推，默认 4000
+ *   DSH_OSD_MAX_CHARS    推出去的文本上限，默认 50（超出截断并加 "..."）
+ *   DSH_OSD_NOTIFY       默认 0；1 打开桌面通知
+ *   DSH_OSD_NOTIFY_LIVE  默认 0；1 表示运行中也弹通知
+ *   DSH_OSD_SOUND        默认 1；一轮结束播放提示音
+ *   DSH_OSD_SOUND_FILE   默认 /usr/share/sounds/freedesktop/stereo/complete.oga
+ *   DSH_OSD_KEY          OSD 任务 id，默认 `dsh-<pid>`
+ *   DSH_OSD_FILE         默认 ~/.cache/dsh-osd.json
  */
 import { execFile } from "node:child_process";
 import fs from "node:fs";
@@ -39,21 +37,9 @@ import path from "node:path";
 export const name = "dsh-progress-osd";
 export const inject: string[] = [];
 
-/* ------------------------------------------------------------------ *
- * 固定 System Prompt（不要加变量，否则打断 DeepSeek 前缀缓存）
- * ------------------------------------------------------------------ */
-const SYSTEM_PROMPT = [
-  "你是 DSH 的进度播报器。你会收到一个 JSON 快照，描述某个编码任务此刻或刚结束时的状态。",
-  "要求：",
-  "1. 用简体中文写一句话，总长不超过 30 个字符，概括当前进度。",
-  '2. stage 为 "running"：说明此刻正在做什么，例如「正在改 niri 快捷键」。',
-  '3. stage 为 "done"：说明这一轮做成了什么，例如「已完成配置修改并重启服务」。',
-  '4. todo 数组非空时，可在句末补完成度，例如「待办 2/5」；不必每次补。',
-  "5. 只输出这句话本身：不要引号、不要解释、不要寒暄、不要换行、不要 emoji。",
-].join("\n");
-
-const APP_NAME = "DSH 进度";
+const APP_NAME = "DSH 思考";
 const ICON = "utilities-terminal";
+const DEFAULT_MAX_CHARS = 50;
 
 /* ------------------------------------------------------------------ *
  * 类型（自包含，不 import DSH 内部类型包：link 进 profile 后解析不到）
@@ -88,30 +74,34 @@ interface ContextLike {
 }
 
 export interface Config {
-  model?: string;
-  baseUrl?: string;
-  apiTimeoutMs?: number;
-  debounceMs?: number;
+  /** 思考停顿多久才推（毫秒），默认 4000；每次新思考都会重置 */
+  thoughtDebounceMs?: number;
+  /** 文本上限，默认 50 字符，超出截断并加 "..." */
   maxChars?: number;
+  /** 桌面通知（toast），默认 false */
   notify?: boolean;
+  /** 运行中也弹通知，默认 false */
   notifyLive?: boolean;
+  /** 运行中通知的最小间隔，默认 20000 */
   minNotifyGapMs?: number;
-  /** 一轮结束时播放提示音（默认 true） */
+  /** 一轮结束时播放提示音，默认 true */
   sound?: boolean;
-  /** 提示音文件，默认 freedesktop 的 complete.oga；设为空串则改用 canberra 音效名 */
+  /** 提示音文件；设为空串则改用 canberra 音效名 */
   soundFile?: string;
+  /** 完成态在顶栏停留多久，默认 3000 */
   doneHoldMs?: number;
-  pollUrl?: string;
-  pollIntervalMs?: number;
-  /** DSH 凭据文件路径，默认 $DSH_HOME/.credentials.yaml（即 ~/.dsh/.credentials.yaml） */
-  credentialsFile?: string;
+  /** 没有 reasoning 时是否回退到可见正文，默认 true */
+  fallbackToText?: boolean;
+  /** OSD 文件，默认 ~/.cache/dsh-osd.json */
+  osdFile?: string;
+  /** OSD 任务 id，默认 `dsh-<pid>` */
+  osdKey?: string;
+  /** 通知标题，默认「DSH 思考」 */
+  title?: string;
 }
 
 interface ResolvedConfig {
-  model: string;
-  baseUrl: string;
-  apiTimeoutMs: number;
-  debounceMs: number;
+  thoughtDebounceMs: number;
   maxChars: number;
   notify: boolean;
   notifyLive: boolean;
@@ -119,11 +109,10 @@ interface ResolvedConfig {
   sound: boolean;
   soundFile: string;
   doneHoldMs: number;
-  pollUrl: string;
-  pollIntervalMs: number;
+  fallbackToText: boolean;
   osdFile: string;
   osdKey: string;
-  credentialsFile: string;
+  title: string;
 }
 
 interface Snapshot {
@@ -135,12 +124,13 @@ interface Snapshot {
   phase: string;
   todos: TodoItem[];
   lastText: string;
-  summary: string;
+  /** 最近一条清洗后的思考文本 */
+  thought: string;
   startedAt: number;
   updatedAt: number;
   done: boolean;
   endReason: string;
-  /** 收尾态（OSD done + 提示音）是否已经推过，避免网络回来后再推一次 */
+  /** 收尾态（OSD done + 提示音）是否已经推过 */
   doneNotified: boolean;
 }
 
@@ -150,7 +140,7 @@ interface Snapshot {
 const clampInt = (value: unknown, fallback: number, min: number, max: number): number => {
   const n = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(n)) return fallback;
-  return Math.min(max, Math.max(min, Math.trunc(n)));
+  return Math.min(max, Math.max(min, Math.round(n)));
 };
 
 const envFlag = (value: string | undefined, fallback: boolean): boolean => {
@@ -158,61 +148,65 @@ const envFlag = (value: string | undefined, fallback: boolean): boolean => {
   return !/^(0|false|no|off)$/i.test(value.trim());
 };
 
-/** 控制字符 / 换行 → 空格，压平空白。终端与通知都只接受单行。 */
+/** 压平任意值成单行文本（去掉换行、连续空白）。 */
 function flatten(value: unknown, limit: number): string {
   const text = String(value ?? "")
-    .replace(/[\u0000-\u001f\u007f\u200b-\u200f\u202a-\u202e]+/g, " ")
-    .replace(/\s+/g, " ")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s{2,}/g, " ")
     .trim();
-  if (text.length <= limit) return text;
-  return text.slice(0, Math.max(1, limit - 1)) + "…";
+  return truncateChars(text, limit);
 }
 
-/** 按「字符」截断（Array.from 才不会把 emoji / 生僻字切成半个）。 */
 function truncateChars(value: string, limit: number): string {
   const chars = Array.from(value);
-  if (chars.length <= limit) return value;
-  return chars.slice(0, Math.max(1, limit - 1)).join("") + "…";
+  return chars.length > limit ? chars.slice(0, limit).join("") : value;
 }
 
-function resolveConfig(config: Config | undefined, logger?: LoggerLike): ResolvedConfig {
-  const cfg = config ?? {};
-  const env = process.env;
-  const debounceRaw = env.DSH_OSD_DEBOUNCE_MS ?? cfg.debounceMs;
-  return {
-    model: env.DSH_OSD_MODEL ?? cfg.model ?? "deepseek-chat",
-    baseUrl: (env.DEEPSEEK_BASE_URL ?? cfg.baseUrl ?? "https://api.deepseek.com").replace(/\/+$/, ""),
-    apiTimeoutMs: clampInt(cfg.apiTimeoutMs, 8000, 1000, 30000),
-    // 硬性下限 5000：需求要求「至少 5 秒防抖」，配置调小也压回 5s，避免把 API 打爆
-    debounceMs: clampInt(debounceRaw, 5000, 5000, 120000),
-    maxChars: clampInt(cfg.maxChars, 30, 10, 80),
-    // 默认不弹系统 toast：进度只在顶栏 OSD 展示，收尾用提示音提醒
-    notify: envFlag(env.DSH_OSD_NOTIFY, cfg.notify ?? false),
-    notifyLive: envFlag(env.DSH_OSD_NOTIFY_LIVE, cfg.notifyLive ?? false),
-    minNotifyGapMs: clampInt(cfg.minNotifyGapMs, 5000, 1000, 600000),
-    sound: envFlag(env.DSH_OSD_SOUND, cfg.sound ?? true),
-    soundFile:
-      env.DSH_OSD_SOUND_FILE ??
-      cfg.soundFile ??
-      "/usr/share/sounds/freedesktop/stereo/complete.oga",
-    doneHoldMs: clampInt(cfg.doneHoldMs, 3000, 500, 30000),
-    pollUrl:
-      env.DSH_OSD_POLL_URL ??
-      cfg.pollUrl ??
-      "http://127.0.0.1:3080/agent-status/api/state",
-    pollIntervalMs: clampInt(cfg.pollIntervalMs, 5000, 1000, 60000),
-    osdFile: env.DSH_OSD_FILE ?? path.join(os.homedir(), ".cache", "dsh-osd.json"),
-    osdKey: env.DSH_OSD_KEY ?? `dsh-${process.pid}`,
-    // DSH 自己的凭据库：DEEPSEEK_API_KEY 就存在这里的 refs 段
-    credentialsFile:
-      env.DSH_OSD_CREDENTIALS ??
-      cfg.credentialsFile ??
-      path.join(env.DSH_HOME ?? path.join(os.homedir(), ".dsh"), ".credentials.yaml"),
-  };
+/**
+ * 清洗模型思考文本：
+ *   1. 去掉代码块（思考里常带示例代码，占满顶栏没意义）
+ *   2. 换行/制表/连续空白 → 单个空格（顶栏是单行跑马灯）
+ *   3. 去掉包裹的引号
+ *   4. 超过 maxChars 个字符直接截断，补 " ..."
+ */
+export function cleanThought(raw: string, maxChars = DEFAULT_MAX_CHARS): string {
+  let text = String(raw ?? "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  text = text.replace(/^["'“”‘’「」]+|["'“”‘’「」]+$/g, "").trim();
+  if (!text) return "";
+  const chars = Array.from(text);
+  if (chars.length > maxChars) {
+    return `${chars.slice(0, maxChars).join("").trimEnd()} ...`;
+  }
+  return text;
+}
+
+interface StreamRecordLike {
+  type?: unknown;
+  texts?: unknown;
+}
+
+/** 从模型 stream 记录里取指定通道的文本（reasoning-chunks / text-chunks）。 */
+export function streamText(stream: unknown, channel: "reasoning-chunks" | "text-chunks"): string {
+  if (!Array.isArray(stream)) return "";
+  const parts: string[] = [];
+  for (const record of stream) {
+    if (!record || typeof record !== "object") continue;
+    const item = record as StreamRecordLike;
+    if (item.type !== channel) continue;
+    if (!Array.isArray(item.texts)) continue;
+    for (const text of item.texts) {
+      if (typeof text === "string") parts.push(text);
+    }
+  }
+  return parts.join("");
 }
 
 /* ------------------------------------------------------------------ *
- * 顶栏 OSD（协议：OSD-PROTOCOL.md）
+ * OSD 文件协议（见 customshell-arch-config/dsh/OSD-PROTOCOL.md）
  * ------------------------------------------------------------------ */
 interface OsdEntry {
   label: string;
@@ -224,267 +218,135 @@ interface OsdEntry {
 
 function readOsdState(file: string): Record<string, OsdEntry> {
   try {
-    const parsed = JSON.parse(fs.readFileSync(file, "utf8") || "{}");
+    const raw = fs.readFileSync(file, "utf8");
+    const parsed = JSON.parse(raw) as unknown;
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
       return parsed as Record<string, OsdEntry>;
     }
-    return {};
   } catch {
-    // 文件不存在 / 正被别的进程写坏：当成空，稍后覆盖成完整 JSON。
-    return {};
+    /* 文件不存在 / 空 / 半截 JSON：当成空表重建 */
   }
+  return {};
 }
 
-/** 原子写：先写临时文件再 rename，避免 QML 侧 cat 到半截 JSON。 */
+/** 原子写：先写 .tmp 再 rename，避免 QML 每 500ms 的 cat 读到半截 JSON。 */
 function writeOsdState(file: string, state: Record<string, OsdEntry>): void {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(state));
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(tmp, `${JSON.stringify(state)}\n`, "utf8");
   fs.renameSync(tmp, file);
 }
 
 function pidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;
   } catch (error) {
-    return (error as NodeJS.ErrnoException | undefined)?.code === "EPERM";
+    // EPERM：进程存在但没有权限发信号 —— 依然算活着
+    return (error as { code?: string })?.code === "EPERM";
   }
 }
 
-/** 清掉异常退出（kill -9 / 崩溃）留下的 dsh-<pid> 键，否则顶栏一直被占。 */
 function pruneStaleEntries(file: string, logger?: LoggerLike): void {
   try {
-    const state = readOsdState(file);
+    const table = readOsdState(file);
     let changed = false;
-    for (const key of Object.keys(state)) {
+    for (const key of Object.keys(table)) {
       if (!key.startsWith("dsh-")) continue;
       const pid = Number(key.slice(4));
-      if (Number.isInteger(pid) && pid > 0 && pidAlive(pid)) continue;
-      delete state[key];
-      changed = true;
+      if (Number.isInteger(pid) && pid > 0 && !pidAlive(pid)) {
+        delete table[key];
+        changed = true;
+      }
     }
-    if (changed) writeOsdState(file, state);
+    if (changed) writeOsdState(file, table);
   } catch (error) {
-    logger?.warn?.(`dsh-progress-osd: 清理 OSD 残留失败: ${(error as Error)?.message ?? String(error)}`);
+    logger?.warn?.(`dsh-progress-osd: 清理旧 OSD 条目失败: ${(error as Error)?.message ?? String(error)}`);
   }
 }
 
 /* ------------------------------------------------------------------ *
- * 动作词（label 列只有 64px，最多 3~4 个中文字）
+ * 工具动作 → 中文动作词 / 简短详情
  * ------------------------------------------------------------------ */
 const ACTION_LABELS: Record<string, string> = {
   bash: "运行命令",
   read: "读文件",
   write: "写文件",
   edit: "改文件",
-  grep: "搜索",
   glob: "找文件",
-  web_search: "联网",
-  web_fetch: "开网页",
-  subagent: "子任务",
-  subagent_fork: "子任务",
-  todo_write: "理任务",
-  present: "出结果",
-  ask_user_question: "等回答",
+  grep: "搜索",
+  ls: "列目录",
+  todo_write: "理待办",
+  todo: "理待办",
+  web_search: "搜网页",
+  web_fetch: "抓网页",
+  task: "派子任务",
+  subagent: "派子任务",
+  ask_user_question: "等你确认",
   skill: "载技能",
-  compress: "压缩",
-  decompress: "展开",
-  acp_status: "看上下文",
 };
 
 function actionLabel(tool: string): string {
-  if (!tool) return "处理中";
+  if (!tool) return "执行中";
   const mapped = ACTION_LABELS[tool];
   if (mapped) return mapped;
-  return flatten(tool, 4) || "处理中";
+  return truncateChars(tool.replace(/[_/-]+/g, " ").trim() || "执行中", 6);
 }
 
-/** tool/call.arguments 是模型原样输出的 JSON 字符串，不是对象。 */
 function shortDetail(tool: string, rawArguments: unknown): string {
   let args: Record<string, unknown> = {};
   if (typeof rawArguments === "string") {
     try {
-      const parsed = JSON.parse(rawArguments);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        args = parsed as Record<string, unknown>;
-      }
+      const parsed = JSON.parse(rawArguments) as unknown;
+      if (parsed && typeof parsed === "object") args = parsed as Record<string, unknown>;
     } catch {
-      args = {};
+      return flatten(rawArguments, 40);
     }
   } else if (rawArguments && typeof rawArguments === "object") {
     args = rawArguments as Record<string, unknown>;
   }
 
-  if (typeof args.description === "string" && args.description.trim()) {
-    return flatten(args.description, 120);
-  }
-  if (tool === "bash" && typeof args.command === "string") {
-    return flatten(args.command.split(/\r?\n/)[0] ?? "", 120);
-  }
-  if (typeof args.file_path === "string") return flatten(args.file_path, 120);
-  if (typeof args.pattern === "string") return flatten(args.pattern, 120);
-  if (typeof args.query === "string") return flatten(args.query, 120);
-  if (typeof args.url === "string") return flatten(args.url, 120);
+  if (typeof args.command === "string") return flatten(args.command, 60);
+  if (typeof args.file_path === "string") return flatten(path.basename(args.file_path), 40);
+  if (typeof args.path === "string") return flatten(path.basename(args.path), 40);
+  if (typeof args.pattern === "string") return flatten(args.pattern, 40);
+  if (typeof args.query === "string") return flatten(args.query, 40);
+  if (typeof args.description === "string") return flatten(args.description, 40);
+  if (typeof args.url === "string") return flatten(args.url, 60);
   return "";
 }
 
 /* ------------------------------------------------------------------ *
- * DeepSeek 调用
+ * 配置
  * ------------------------------------------------------------------ */
-function sanitizeModelText(raw: string): string {
-  let text = raw
-    .replace(/```[\s\S]*?```/g, " ")
-    .replace(/^[\s"'“”‘’「」]+|[\s"'“”‘’「」]+$/g, "")
-    .replace(/^(概括|摘要|进度)\s*[:：]\s*/, "")
-    .replace(/\s+/g, " ")
-    .trim();
-  // 模型偶尔会输出多句，只留第一句
-  const cut = text.search(/[。！？!?]\s/);
-  if (cut > 0) text = text.slice(0, cut);
-  return text.trim();
-}
+function resolveConfig(config: Config | undefined, logger?: LoggerLike): ResolvedConfig {
+  const cfg = config ?? {};
+  const env = process.env;
+  const debounceRaw = env.DSH_OSD_DEBOUNCE_MS ?? cfg.thoughtDebounceMs;
+  const maxCharsRaw = env.DSH_OSD_MAX_CHARS ?? cfg.maxChars;
+  const soundFile = (env.DSH_OSD_SOUND_FILE ?? cfg.soundFile ?? "").trim();
 
-interface DeepSeekResult {
-  text: string | null;
-  error?: string;
-}
+  const resolved: ResolvedConfig = {
+    // 3–5 秒是体感合适的区间；下限 500ms 方便自测，上限 60s 防止手滑写错
+    thoughtDebounceMs: clampInt(debounceRaw, 4000, 500, 60000),
+    maxChars: clampInt(maxCharsRaw, DEFAULT_MAX_CHARS, 10, 200),
+    notify: envFlag(env.DSH_OSD_NOTIFY, cfg.notify ?? false),
+    notifyLive: envFlag(env.DSH_OSD_NOTIFY_LIVE, cfg.notifyLive ?? false),
+    minNotifyGapMs: clampInt(cfg.minNotifyGapMs, 20000, 1000, 600000),
+    sound: envFlag(env.DSH_OSD_SOUND, cfg.sound ?? true),
+    soundFile: soundFile || "/usr/share/sounds/freedesktop/stereo/complete.oga",
+    doneHoldMs: clampInt(process.env.DSH_OSD_DONE_HOLD_MS ?? cfg.doneHoldMs, 3000, 0, 60000),
+    fallbackToText: cfg.fallbackToText ?? true,
+    osdFile: (env.DSH_OSD_FILE ?? cfg.osdFile ?? path.join(os.homedir(), ".cache", "dsh-osd.json")).trim(),
+    osdKey: (env.DSH_OSD_KEY ?? cfg.osdKey ?? `dsh-${process.pid}`).trim(),
+    title: (env.DSH_OSD_TITLE ?? cfg.title ?? APP_NAME).trim() || APP_NAME,
+  };
 
-/**
- * 找 API key 的优先链：进程环境变量 → DSH 自己的凭据库（~/.dsh/.credentials.yaml）。
- *
- * DSH 把在设置面板里填的 key 存在凭据文件里（refs.DEEPSEEK_API_KEY），并不会导出到
- * 子进程环境，所以插件光读 process.env 是拿不到的。这里直接复用同一个 key：
- * 用户在 DSH 里配一次，插件就能跟着用，不需要再单独配一份。
- *
- * 只做「refs 段里找同名键」的行级解析，不引入 YAML 依赖；解析失败静默返回空串。
- */
-let keyCache: { value: string; at: number } | null = null;
-
-function keyFromCredentialsFile(file: string): string {
-  try {
-    const text = fs.readFileSync(file, "utf8");
-    let inRefs = false;
-    for (const line of text.split(/\r?\n/)) {
-      if (/^refs:\s*$/.test(line)) {
-        inRefs = true;
-        continue;
-      }
-      if (inRefs) {
-        if (/^\S/.test(line)) inRefs = false; // 顶格的新键 = refs 段结束
-        else {
-          const match = /^\s+([A-Za-z0-9_]+)\s*:\s*(.+?)\s*$/.exec(line);
-          if (match && match[1] === "DEEPSEEK_API_KEY") {
-            return match[2].replace(/^["']|["']$/g, "").trim();
-          }
-        }
-      }
-      // 兼容 refs 写成单行内联对象的情况
-      const inline = /^\{?\s*DEEPSEEK_API_KEY\s*:\s*([^,}\s]+)/.exec(line);
-      if (!inRefs && inline) return inline[1].replace(/^["']|["']$/g, "");
-    }
-  } catch {
-    /* 文件不存在 / 没权限：静默降级 */
+  if (resolved.maxChars !== DEFAULT_MAX_CHARS) {
+    logger?.info?.(`dsh-progress-osd: 文本上限 ${resolved.maxChars} 字`);
   }
-  return "";
-}
-
-function resolveApiKey(cfg: ResolvedConfig, logger?: LoggerLike): string {
-  const fromEnv = (process.env.DEEPSEEK_API_KEY ?? "").trim();
-  if (fromEnv) return fromEnv;
-
-  if (keyCache && Date.now() - keyCache.at < 60_000) return keyCache.value;
-
-  const fromFile = keyFromCredentialsFile(cfg.credentialsFile);
-  keyCache = { value: fromFile, at: Date.now() };
-  if (fromFile) {
-    logger?.info?.(`dsh-progress-osd: 复用 DSH 凭据库里的 DEEPSEEK_API_KEY（${cfg.credentialsFile}）`);
-  }
-  return fromFile;
-}
-
-async function callDeepSeek(
-  cfg: ResolvedConfig,
-  userContent: string,
-  logger?: LoggerLike,
-): Promise<DeepSeekResult> {
-  const apiKey = resolveApiKey(cfg, logger);
-  if (!apiKey) {
-    return {
-      text: null,
-      error: `DEEPSEEK_API_KEY 未设置（环境变量与 ${cfg.credentialsFile} 都没有）`,
-    };
-  }
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), cfg.apiTimeoutMs);
-  timer.unref?.();
-
-  try {
-    const response = await (globalThis as { fetch: typeof fetch }).fetch(
-      `${cfg.baseUrl}/chat/completions`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model: cfg.model,
-          messages: [
-            { role: "system", content: SYSTEM_PROMPT },
-            { role: "user", content: userContent },
-          ],
-          max_tokens: 100,
-          temperature: 0,
-          stream: false,
-        }),
-        signal: controller.signal,
-      },
-    );
-
-    if (!response.ok) {
-      const body = await response.text().catch(() => "");
-      return { text: null, error: `HTTP ${response.status} ${flatten(body, 120)}` };
-    }
-
-    const json = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-    const content = json?.choices?.[0]?.message?.content;
-    if (typeof content !== "string") return { text: null, error: "响应里没有 choices[0].message.content" };
-
-    const text = sanitizeModelText(content);
-    if (!text) return { text: null, error: "模型返回空文本" };
-    return { text: truncateChars(text, cfg.maxChars) };
-  } catch (error) {
-    const err = error as { name?: string; message?: string };
-    const reason = err?.name === "AbortError" ? `请求超时（${cfg.apiTimeoutMs}ms）` : (err?.message ?? String(error));
-    return { text: null, error: reason };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/* ------------------------------------------------------------------ *
- * 本地兜底摘要（API 不可用时也要有话说）
- * ------------------------------------------------------------------ */
-function todoProgress(snapshot: Snapshot): string {
-  if (snapshot.todos.length === 0) return "";
-  const done = snapshot.todos.filter((item) => item.status === "completed").length;
-  return `待办 ${done}/${snapshot.todos.length}`;
-}
-
-function fallbackSummary(snapshot: Snapshot, stage: "running" | "done", maxChars: number): string {
-  const progress = todoProgress(snapshot);
-  if (stage === "done") {
-    if (snapshot.endReason === "aborted") return truncateChars(["已中止本轮", progress].filter(Boolean).join(" · "), maxChars);
-    if (snapshot.endReason === "error") return truncateChars(["本轮出错", progress].filter(Boolean).join(" · "), maxChars);
-    const action = snapshot.action ? `已完成${actionLabel(snapshot.action)}` : "任务已完成";
-    return truncateChars([action, progress].filter(Boolean).join(" · "), maxChars);
-  }
-  const parts = [snapshot.phase, snapshot.detail ? truncateChars(snapshot.detail, 18) : "", progress];
-  return truncateChars(parts.filter(Boolean).join(" · ") || "正在处理", maxChars);
+  return resolved;
 }
 
 /* ------------------------------------------------------------------ *
@@ -493,14 +355,12 @@ function fallbackSummary(snapshot: Snapshot, stage: "running" | "done", maxChars
 export function apply(ctx: ContextLike, config?: Config): void {
   const logger = ctx.logger;
   const cfg = resolveConfig(config, logger);
-  const startedAt = Date.now();
 
-  /* ---------------- 快照与状态 ---------------- */
+  /* ---------------- 状态 ---------------- */
   const sessions = new Map<string, Snapshot>();
   let activeSessionId = "";
-  let lastSummary = "";
 
-  let debounceTimer: Timer | null = null;
+  let thoughtTimer: Timer | null = null;
   let osdTimer: Timer | null = null;
   let doneTimer: Timer | null = null;
   let lastOsdWrite = 0;
@@ -513,15 +373,8 @@ export function apply(ctx: ContextLike, config?: Config): void {
   let lastNotifyAt = 0;
   let lastNotifyText = "";
 
-  let summarizeInFlight = false;
-  let pendingStage: "running" | "done" | null = null;
-
-  let eventSeen = false;
-  let pollTimer: Timer | null = null;
-  let pollFailures = 0;
-  let pollDisabled = cfg.pollUrl === "";
-  let warnedNoKey = false;
-  let warnedApiOnce = false;
+  let warnedNoReasoning = false;
+  let sawReasoning = false;
 
   const sessionIdOf = (session: SessionLike | undefined): string => {
     const id = session?.id;
@@ -540,7 +393,7 @@ export function apply(ctx: ContextLike, config?: Config): void {
       phase: "思考中",
       todos: [],
       lastText: "",
-      summary: lastSummary,
+      thought: "",
       startedAt: now,
       updatedAt: now,
       done: false,
@@ -554,7 +407,6 @@ export function apply(ctx: ContextLike, config?: Config): void {
     if (!snapshot) {
       snapshot = newSnapshot(sessionId, 0);
       sessions.set(sessionId, snapshot);
-      // 多开会话时不让 Map 无限长
       if (sessions.size > 8) {
         const oldest = [...sessions.entries()].sort((a, b) => a[1].updatedAt - b[1].updatedAt)[0];
         if (oldest && oldest[0] !== sessionId) sessions.delete(oldest[0]);
@@ -608,7 +460,7 @@ export function apply(ctx: ContextLike, config?: Config): void {
       return;
     }
 
-    // 协议要求 300ms 节流；内容没变就不重复写盘（updated 只在真变化时刷新）。
+    // 协议要求 300ms 节流；内容没变就不重复写盘
     if (state.label === lastOsdLabel && state.command === lastOsdCommand && !lastOsdDone && osdShown) return;
     if (osdTimer) return;
     const wait = Math.max(0, 300 - (now - lastOsdWrite));
@@ -637,14 +489,14 @@ export function apply(ctx: ContextLike, config?: Config): void {
   /* ---------------- 桌面通知 ---------------- */
   function notifySend(title: string, body: string): void {
     if (!cfg.notify) return;
-    const safeTitle = flatten(title, 64) || APP_NAME;
+    const safeTitle = flatten(title, 64) || cfg.title;
     const safeBody = flatten(body, 160);
     if (!safeBody) return;
-    // execFile 直接传参数数组，不经过 shell，天然免疫命令注入；
-    // 仍要压平控制字符，避免 mako 渲染异常。`--` 终止选项解析，防正文/标题以 "-" 开头被当参数。
+    // execFile 直接传参数数组、不经过 shell，天然免疫命令注入；
+    // `--` 终止选项解析，防止正文以 "-" 开头被当成参数。
     execFile(
       "notify-send",
-      ["-a", APP_NAME, "-i", ICON, "-t", "6000", "--", safeTitle, safeBody],
+      ["-a", cfg.title, "-i", ICON, "-t", "6000", "--", safeTitle, safeBody],
       { timeout: 3000 },
       (error) => {
         if (error) logger?.warn?.(`dsh-progress-osd: notify-send 失败: ${error.message}`);
@@ -659,13 +511,12 @@ export function apply(ctx: ContextLike, config?: Config): void {
     if (now - lastNotifyAt < cfg.minNotifyGapMs) return;
     lastNotifyAt = now;
     lastNotifyText = text;
-    notifySend(APP_NAME, text);
+    notifySend(cfg.title, text);
   }
 
   /* ---------------- 提示音 ---------------- */
   function playDoneSound(): void {
     if (!cfg.sound) return;
-    // 只用 execFile 传参数数组：不经过 shell，文件名里的空格/引号都不会变成命令
     const file = cfg.soundFile;
     const fallback = (): void => {
       execFile("canberra-gtk-play", ["-i", "complete"], { timeout: 2000 }, () => {});
@@ -678,16 +529,12 @@ export function apply(ctx: ContextLike, config?: Config): void {
         return;
       }
     } catch {
-      // 文件探测失败直接走 canberra
+      /* 文件探测失败直接走 canberra */
     }
     fallback();
   }
 
-  /* ---------------- 即时本地文本（不等模型） ---------------- */
-  /**
-   * 事件到达的瞬间就先给顶栏一句话：只有本地拼装，零网络。
-   * 5 秒后模型概括回来再覆盖它，所以进度永远「先到一步」。
-   */
+  /* ---------------- 即时本地文本（工具动作，零网络） ---------------- */
   function liveText(snapshot: Snapshot): string {
     const progress = todoProgress(snapshot);
     const parts: string[] = [];
@@ -703,45 +550,57 @@ export function apply(ctx: ContextLike, config?: Config): void {
     return truncateChars(parts.join(" · "), 44);
   }
 
-  function buildSnapshotJson(snapshot: Snapshot, stage: "running" | "done"): string {
-    const payload: Record<string, unknown> = {
-      stage,
-      turn: snapshot.turn,
-      step: snapshot.step,
-      state: snapshot.phase,
-      tool: snapshot.action || undefined,
-      doing: snapshot.detail ? truncateChars(snapshot.detail, 120) : undefined,
-      todos: snapshot.todos.length
-        ? snapshot.todos.slice(0, 8).map((item) => ({
-            text: truncateChars(flatten(item.content, 60), 60),
-            status: item.status,
-          }))
-        : undefined,
-      lastReply: snapshot.lastText ? truncateChars(snapshot.lastText, 200) : undefined,
-      endReason: stage === "done" ? snapshot.endReason || "completed" : undefined,
-      elapsedSec: Math.max(0, Math.round((Date.now() - snapshot.startedAt) / 1000)),
-    };
-    return JSON.stringify(payload);
+  function todoProgress(snapshot: Snapshot): string {
+    if (snapshot.todos.length === 0) return "";
+    const done = snapshot.todos.filter((item) => item.status === "completed").length;
+    return `待办 ${done}/${snapshot.todos.length}`;
   }
 
-  function publishRunning(snapshot: Snapshot, text: string): void {
-    snapshot.summary = text;
-    lastSummary = text;
-    // label 固定两态，动作细节在 command 里，避免「思考中/执行中」来回跳
-    pushOsd({ label: "执行中", command: text, done: false }, false);
-  }
-
-  function publishDone(snapshot: Snapshot, text: string): void {
-    snapshot.summary = text;
-    // 不写 lastSummary：否则下一轮 turn/start 会把「已完成」这类收尾语当作 command 顶上去
-    if (snapshot.doneNotified) {
-      // 已经收尾过了（本地先推、模型后到）：OSD 保持不变，只记录更凝练的一版
-      logger?.info?.(`dsh-progress-osd: 本轮概括 ${text}`);
-      return;
+  function fallbackSummary(snapshot: Snapshot, stage: "running" | "done"): string {
+    const progress = todoProgress(snapshot);
+    if (stage === "done") {
+      if (snapshot.endReason === "aborted") return cleanThought(["已中止本轮", progress].filter(Boolean).join(" · "), cfg.maxChars);
+      if (snapshot.endReason === "error") return cleanThought(["本轮出错", progress].filter(Boolean).join(" · "), cfg.maxChars);
+      const action = snapshot.action ? `已完成${actionLabel(snapshot.action)}` : "任务已完成";
+      return cleanThought([action, progress].filter(Boolean).join(" · "), cfg.maxChars);
     }
+    const parts = [snapshot.phase, snapshot.detail ? truncateChars(snapshot.detail, 18) : "", progress];
+    return cleanThought(parts.filter(Boolean).join(" · ") || "正在处理", cfg.maxChars);
+  }
+
+  /* ---------------- 思考推送（trailing debounce） ---------------- */
+  /**
+   * 每来一段新思考就重置计时器：只有「思考停顿了」才把最新一条推出去，
+   * 不会连续吐字时刷屏，也不会漏掉最后一句。
+   */
+  function scheduleThoughtPush(): void {
+    if (thoughtTimer) clearTimeout(thoughtTimer);
+    thoughtTimer = setTimeout(() => {
+      thoughtTimer = null;
+      flushThought();
+    }, cfg.thoughtDebounceMs);
+    thoughtTimer.unref?.();
+  }
+
+  function flushThought(): void {
+    try {
+      const snapshot = activeSnapshot();
+      if (!snapshot || snapshot.done) return;
+      const text = snapshot.thought;
+      if (!text) return;
+      pushOsd({ label: "思考中", command: text, done: false }, false);
+      if (cfg.notifyLive) notifyThrottled(text);
+    } catch (error) {
+      logger?.warn?.(`dsh-progress-osd: 推送思考失败: ${(error as Error)?.message ?? String(error)}`);
+    }
+  }
+
+  /* ---------------- 收尾 ---------------- */
+  function publishDone(snapshot: Snapshot, text: string): void {
+    if (snapshot.doneNotified) return;
     snapshot.doneNotified = true;
     pushOsd({ label: "任务已完成", command: "", done: true }, false);
-    notifySend(APP_NAME, text);
+    notifySend(cfg.title, text);
     playDoneSound();
     if (doneTimer) clearTimeout(doneTimer);
     doneTimer = setTimeout(() => {
@@ -751,81 +610,55 @@ export function apply(ctx: ContextLike, config?: Config): void {
     doneTimer.unref?.();
   }
 
-  async function summarize(stage: "running" | "done", options?: { force?: boolean }): Promise<void> {
-    const snapshot = activeSnapshot();
-    if (!snapshot) return;
-    if (snapshot.done && stage === "running") return;
-
-    // 运行中不强制：刚概括过（<2s）且文本已存在就跳过，省 token
-    if (stage === "running" && !options?.force && snapshot.summary && Date.now() - snapshot.updatedAt < 1500) return;
-
-    if (summarizeInFlight) {
-      // 保留最强的 stage：进行中的请求结束后，done 优先补发，绝不降级成 running
-      if (stage === "done" || pendingStage === null) pendingStage = stage;
-      return;
-    }
-    summarizeInFlight = true;
-    try {
-      const userContent = buildSnapshotJson(snapshot, stage);
-      let text: string | null = null;
-      try {
-        const result = await callDeepSeek(cfg, userContent, logger);
-        text = result.text;
-        if (!text && result.error) {
-          if (result.error.includes("DEEPSEEK_API_KEY")) {
-            if (!warnedNoKey) {
-              warnedNoKey = true;
-              logger?.info?.("dsh-progress-osd: 未设置 DEEPSEEK_API_KEY，改用本地兜底摘要（通知与 OSD 照常工作）");
-            }
-          } else if (!warnedApiOnce) {
-            warnedApiOnce = true;
-            logger?.warn?.(`dsh-progress-osd: 概括失败，改用兜底文本: ${result.error}`);
-          } else {
-            logger?.info?.(`dsh-progress-osd: 概括失败（已降级）: ${result.error}`);
-          }
-        }
-      } catch (error) {
-        logger?.warn?.(`dsh-progress-osd: 概括异常: ${(error as Error)?.message ?? String(error)}`);
-      }
-
-      const finalText = text ?? fallbackSummary(snapshot, stage, cfg.maxChars);
-
-      if (stage === "done") {
-        publishDone(snapshot, finalText);
-      } else {
-        publishRunning(snapshot, finalText);
-        if (cfg.notifyLive) notifyThrottled(finalText);
-      }
-    } finally {
-      summarizeInFlight = false;
-      const next = pendingStage;
-      pendingStage = null;
-      if (next === "done") {
-        void summarize("done", { force: true });
-      } else if (next === "running") {
-        const latest = activeSnapshot();
-        if (latest && !latest.done) void summarize("running", { force: true });
-      }
-    }
-  }
-
-  function scheduleSummarize(): void {
-    // 关键：不重置计时器。否则连续动作（每几秒一个 tool）会把 5 秒一推再推，
-    // 概括永远等不到窗口，表现就是「活都干完了才冒出一句话」。
-    if (debounceTimer) return;
-    debounceTimer = setTimeout(() => {
-      debounceTimer = null;
-      void summarize("running");
-    }, cfg.debounceMs);
-    debounceTimer.unref?.();
-  }
-
   /* ---------------- 事件 ---------------- */
+  /**
+   * 从 assistant/message、assistant/attempt 的 stream 里取思考文本。
+   * 返回 true 表示拿到了新文本。
+   */
+  function absorbThought(snapshot: Snapshot, data: Record<string, unknown>): boolean {
+    const stream = data.stream;
+    let reasoning = streamText(stream, "reasoning-chunks");
+    let source: "reasoning" | "text" = "reasoning";
+    if (!reasoning && cfg.fallbackToText) {
+      source = "text";
+      reasoning = streamText(stream, "text-chunks");
+      // 有些适配器把正文放在 message.content 里而不是 stream
+      if (!reasoning) {
+        const message = data.message as { content?: unknown } | undefined;
+        const content = message?.content;
+        if (typeof content === "string") reasoning = content;
+        else if (Array.isArray(content)) {
+          reasoning = content
+            .map((part) =>
+              part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string"
+                ? (part as { text: string }).text
+                : "",
+            )
+            .join(" ");
+        }
+      }
+    }
+
+    const cleaned = cleanThought(reasoning, cfg.maxChars);
+    if (!cleaned) return false;
+
+    if (source === "reasoning" && !sawReasoning) {
+      sawReasoning = true;
+      logger?.info?.("dsh-progress-osd: 已接入模型 reasoning 流");
+    }
+    if (source === "text" && !sawReasoning && !warnedNoReasoning) {
+      warnedNoReasoning = true;
+      logger?.info?.("dsh-progress-osd: 该模型没有 reasoning 通道，回退到可见正文");
+    }
+
+    snapshot.thought = cleaned;
+    return true;
+  }
+
   function onSessionEvent(session: SessionLike, event: SessionEventLike): void {
     try {
       const type = event?.type;
       if (!type) return;
-      eventSeen = true;
       const sessionId = sessionIdOf(session);
       activeSessionId = sessionId;
       const data = (event.data ?? {}) as Record<string, unknown>;
@@ -839,7 +672,10 @@ export function apply(ctx: ContextLike, config?: Config): void {
           clearTimeout(doneTimer);
           doneTimer = null;
         }
-        // 新一轮从干净状态起步，不要拿上一轮的摘要顶上（那正是「看着像没动」的来源）
+        if (thoughtTimer) {
+          clearTimeout(thoughtTimer);
+          thoughtTimer = null;
+        }
         pushOsd({ label: "思考中", command: "", done: false }, true);
         return;
       }
@@ -856,21 +692,40 @@ export function apply(ctx: ContextLike, config?: Config): void {
         return;
       }
 
+      // 思考正文：模型一步结束时一次性给出完整 stream
+      if (type === "assistant/message" || type === "assistant/attempt") {
+        if (snapshot.done) return;
+        const message = data.message as { content?: unknown } | undefined;
+        const content = message?.content;
+        if (typeof content === "string") snapshot.lastText = flatten(content, 400);
+        else if (Array.isArray(content)) {
+          snapshot.lastText = flatten(
+            content
+              .map((part) =>
+                part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string"
+                  ? (part as { text: string }).text
+                  : "",
+              )
+              .join(" "),
+            400,
+          );
+        }
+        // 先让工具动作的即时文本落一下，再排队思考（思考停顿 4s 后覆盖它）
+        if (absorbThought(snapshot, data)) scheduleThoughtPush();
+        return;
+      }
+
       if (type === "tool/call") {
         snapshot.action = typeof data.name === "string" ? data.name : "";
         snapshot.detail = shortDetail(snapshot.action, data.arguments);
         snapshot.phase = actionLabel(snapshot.action);
-        // label 只表达「在思考 / 在执行」，具体动作交给 command（那里有空格跑马灯）
         pushOsd({ label: "执行中", command: liveText(snapshot), done: false }, false);
-        scheduleSummarize();
         return;
       }
 
       if (type === "tool/result") {
-        // 工具刚跑完、模型还在看结果：整段都算执行阶段，别急着切回「思考中」
         snapshot.phase = "执行中";
         pushOsd({ label: "执行中", command: liveText(snapshot), done: false }, false);
-        scheduleSummarize();
         return;
       }
 
@@ -880,26 +735,6 @@ export function apply(ctx: ContextLike, config?: Config): void {
           (item) => item && typeof item.content === "string" && typeof item.status === "string",
         );
         pushOsd({ label: "执行中", command: liveText(snapshot), done: false }, false);
-        scheduleSummarize();
-        return;
-      }
-
-      if (type === "assistant/message") {
-        const message = data.message as { content?: unknown } | undefined;
-        const content = message?.content;
-        if (typeof content === "string") snapshot.lastText = flatten(content, 400);
-        else if (Array.isArray(content)) {
-          const joined = content
-            .map((part) =>
-              part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string"
-                ? (part as { text: string }).text
-                : "",
-            )
-            .join(" ");
-          snapshot.lastText = flatten(joined, 400);
-        }
-        // 模型一旦开始产出内容，就是「事情在推进」，按执行态展示；真正没开口才是思考中
-        if (!snapshot.done) pushOsd({ label: "执行中", command: liveText(snapshot), done: false }, false);
         return;
       }
 
@@ -907,13 +742,13 @@ export function apply(ctx: ContextLike, config?: Config): void {
         const reason = data.reason as { kind?: string } | undefined;
         snapshot.endReason = typeof reason?.kind === "string" ? reason.kind : "completed";
         snapshot.done = true;
-        if (debounceTimer) {
-          clearTimeout(debounceTimer);
-          debounceTimer = null;
+        if (thoughtTimer) {
+          clearTimeout(thoughtTimer);
+          thoughtTimer = null;
         }
-        // 关键：本地兜底文本 + 提示音立刻落地（不等网络），模型概括随后补发
-        publishDone(snapshot, fallbackSummary(snapshot, "done", cfg.maxChars));
-        void summarize("done", { force: true });
+        // 收尾文本：优先用本段最后的思考，其次本地规则兜底（都不联网）
+        const finalText = snapshot.thought || fallbackSummary(snapshot, "done");
+        publishDone(snapshot, finalText);
         return;
       }
     } catch (error) {
@@ -924,84 +759,20 @@ export function apply(ctx: ContextLike, config?: Config): void {
   function onAgentStatus(payload: { status?: string } | undefined): void {
     try {
       if (payload?.status !== "idle") return;
-      // 兜底：turn/end 没等到（异常退出/取消），idle 且 6s 没动静就收尾
+      // 兜底：turn/end 没等到（异常退出 / 取消），idle 且 6s 没动静就收尾
       const snapshot = activeSnapshot();
       if (!snapshot || snapshot.done) return;
-      const idleAt = Date.now();
       setTimeout(() => {
         const latest = activeSnapshot();
         if (!latest || latest.done) return;
         if (Date.now() - latest.updatedAt < 5000) return;
-        if (idleAt < latest.startedAt) return;
         latest.done = true;
         latest.endReason = "idle";
-        // 同样先本地收尾（含提示音），模型概括在后台补
-        publishDone(latest, fallbackSummary(latest, "done", cfg.maxChars));
-        void summarize("done", { force: true });
+        publishDone(latest, latest.thought || fallbackSummary(latest, "done"));
       }, 6000).unref?.();
     } catch (error) {
       logger?.warn?.(`dsh-progress-osd: agent/status 处理失败: ${(error as Error)?.message ?? String(error)}`);
     }
-  }
-
-  /* ---------------- 轮询兜底 ---------------- */
-  async function pollOnce(): Promise<void> {
-    if (pollDisabled) return;
-    try {
-      const response = await (globalThis as { fetch: typeof fetch }).fetch(cfg.pollUrl, {
-        headers: { Accept: "application/json" },
-        signal: AbortSignal.timeout(3000),
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const body = (await response.json()) as Record<string, unknown>;
-      pollFailures = 0;
-      const state = (body.state ?? body) as Record<string, unknown>;
-      if (!state || typeof state !== "object") return;
-      eventSeen = true;
-      const sessionId = `poll:${String(state.sessionId ?? state.id ?? "default")}`;
-      activeSessionId = sessionId;
-      const snapshot = snapshotFor(sessionId);
-      snapshot.updatedAt = Date.now();
-      if (typeof state.action === "string") snapshot.action = state.action;
-      if (typeof state.tool === "string") snapshot.action = state.tool;
-      if (typeof state.step === "number") snapshot.step = state.step;
-      if (typeof state.turn === "number") snapshot.turn = state.turn;
-      if (typeof state.label === "string") snapshot.phase = flatten(state.label, 16) || snapshot.phase;
-      if (Array.isArray(state.todos)) snapshot.todos = state.todos as TodoItem[];
-      pushOsd(
-        { label: snapshot.phase, command: snapshot.summary || lastSummary, done: false },
-        snapshot.turn === 1 && snapshot.step === 0,
-      );
-      scheduleSummarize();
-    } catch (error) {
-      pollFailures += 1;
-      const message = (error as Error)?.message ?? String(error);
-      // 404/501 = 该接口根本没实现，重试没有意义，立刻停
-      const gone = message.includes("HTTP 404") || message.includes("HTTP 501");
-      if (gone) stopPolling(`接口不存在（${message}）`);
-      else if (pollFailures >= 3) stopPolling(message);
-    }
-  }
-
-  function stopPolling(reason: string): void {
-    if (pollDisabled) return;
-    pollDisabled = true;
-    if (pollTimer) {
-      clearInterval(pollTimer);
-      pollTimer = null;
-    }
-    logger?.info?.(`dsh-progress-osd: 已停止轮询兜底（${cfg.pollUrl} / ${reason}），仅依赖 SessionEvent`);
-  }
-
-  function startPollingIfNeeded(): void {
-    if (pollDisabled || pollTimer) return;
-    if (eventSeen) return;
-    if (Date.now() - startedAt < 8000) return;
-    pollTimer = setInterval(() => {
-      void pollOnce();
-    }, cfg.pollIntervalMs);
-    pollTimer.unref?.();
-    void pollOnce();
   }
 
   /* ---------------- 同 key 冲突提示 ---------------- */
@@ -1011,12 +782,12 @@ export function apply(ctx: ContextLike, config?: Config): void {
       const entry = table[cfg.osdKey];
       if (entry && typeof entry.updated === "number" && Date.now() - entry.updated < 15000) {
         logger?.warn?.(
-          `dsh-progress-osd: 检测到另一个写入者正在占用 OSD key "${cfg.osdKey}"（很可能是 dsh-osd-progress）。` +
+          `dsh-progress-osd: 检测到另一个写入者正在占用 OSD key "${cfg.osdKey}"（很可能是旧的 dsh-osd-progress）。` +
             "两者会互相抢位，建议在 profile 里禁用其中一个。",
         );
       }
     } catch {
-      /* 读不到就算了，不影响主流程 */
+      /* 读不到就算了 */
     }
   }
 
@@ -1038,7 +809,7 @@ export function apply(ctx: ContextLike, config?: Config): void {
             if (typeof off === "function") offs.push(off as () => void);
           } catch (inner) {
             logger?.warn?.(
-              `dsh-progress-osd: 订阅 ${event} 失败: ${(inner as Error)?.message ?? String(inner)}（${(error as Error)?.message ?? ""}）`,
+              `dsh-progress-osd: 订阅 ${event} 失败: ${(inner as Error)?.message ?? String(error)}`,
             );
           }
         }
@@ -1047,18 +818,11 @@ export function apply(ctx: ContextLike, config?: Config): void {
       subscribe("session/event", onSessionEvent as unknown as (...args: never[]) => void);
       subscribe("agent/status", onAgentStatus as unknown as (...args: never[]) => void);
 
-      const idleWatch = setInterval(() => {
-        startPollingIfNeeded();
-      }, 5000);
-      idleWatch.unref?.();
-
       const onExit = (): void => {
         try {
-          if (debounceTimer) clearTimeout(debounceTimer);
+          if (thoughtTimer) clearTimeout(thoughtTimer);
           if (osdTimer) clearTimeout(osdTimer);
           if (doneTimer) clearTimeout(doneTimer);
-          if (pollTimer) clearInterval(pollTimer);
-          clearInterval(idleWatch);
           osdShown = true; // 允许 exit 时删掉自己的 key
           clearOsd();
         } catch {
@@ -1069,15 +833,12 @@ export function apply(ctx: ContextLike, config?: Config): void {
 
       return () => {
         process.off("exit", onExit);
-        clearInterval(idleWatch);
-        if (debounceTimer) clearTimeout(debounceTimer);
+        if (thoughtTimer) clearTimeout(thoughtTimer);
         if (osdTimer) clearTimeout(osdTimer);
         if (doneTimer) clearTimeout(doneTimer);
-        if (pollTimer) clearInterval(pollTimer);
-        debounceTimer = null;
+        thoughtTimer = null;
         osdTimer = null;
         doneTimer = null;
-        pollTimer = null;
         for (const off of offs) {
           try {
             off();
@@ -1089,6 +850,6 @@ export function apply(ctx: ContextLike, config?: Config): void {
         clearOsd();
       };
     },
-    "dsh-progress-osd: 会话进度 → 顶栏 OSD / 桌面通知",
+    "dsh-progress-osd: 模型思考 → 顶栏 OSD",
   );
 }

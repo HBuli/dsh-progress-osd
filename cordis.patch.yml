@@ -7,11 +7,14 @@
     - id: progress-osd
       name: 'dsh-progress-osd'
       config:
-        model: deepseek-chat
-        debounceMs: 5000
-        maxChars: 30
+        # 思考停顿多久才推（毫秒）：每来一段新思考都会重置计时器
+        thoughtDebounceMs: 4000
+        # 顶栏单行最多 50 字，超出截断并加 " ..."
+        maxChars: 50
         # 不弹系统 toast：进度只在顶栏 OSD 显示，收尾用提示音提醒
         notify: false
         notifyLive: false
         sound: true
         soundFile: /usr/share/sounds/freedesktop/stereo/complete.oga
+        # 没有 reasoning 通道的模型回退到可见正文
+        fallbackToText: true
