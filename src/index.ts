@@ -175,6 +175,13 @@ export function cleanThought(raw: string, maxChars = DEFAULT_MAX_CHARS): string 
     .replace(/[\r\n\t]+/g, " ")
     .replace(/\s{2,}/g, " ")
     .trim();
+  // 思考里常带 markdown 强调/编号，顶栏只显示纯文本
+  text = text
+    .replace(/\*\*|__|`{1,3}|~~/g, "")
+    .replace(/(^|\s)#{1,6}\s*/g, " ")
+    .replace(/(^|\s)[-*+]\s+/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
   text = text.replace(/^["'“”‘’「」]+|["'“”‘’「」]+$/g, "").trim();
   if (!text) return "";
   const chars = Array.from(text);
@@ -550,6 +557,15 @@ export function apply(ctx: ContextLike, config?: Config): void {
     return truncateChars(parts.join(" · "), 44);
   }
 
+  /**
+   * 顶栏只有一行，信息量最大的内容是「模型在想什么」。
+   * 所以一旦有思考文本，command 就常驻它（跑马灯慢慢滚），工具动作只去换 label；
+   * 没有思考文本（模型无 reasoning 通道）时才退回本地拼装的动作文本。
+   */
+  function currentCommand(snapshot: Snapshot): string {
+    return snapshot.thought || liveText(snapshot);
+  }
+
   function todoProgress(snapshot: Snapshot): string {
     if (snapshot.todos.length === 0) return "";
     const done = snapshot.todos.filter((item) => item.status === "completed").length;
@@ -683,7 +699,7 @@ export function apply(ctx: ContextLike, config?: Config): void {
       if (type === "step/start") {
         snapshot.step = Number(data.step ?? snapshot.step);
         snapshot.phase = "思考中";
-        pushOsd({ label: "思考中", command: liveText(snapshot), done: false }, false);
+        pushOsd({ label: "思考中", command: currentCommand(snapshot), done: false }, false);
         return;
       }
 
@@ -719,13 +735,14 @@ export function apply(ctx: ContextLike, config?: Config): void {
         snapshot.action = typeof data.name === "string" ? data.name : "";
         snapshot.detail = shortDetail(snapshot.action, data.arguments);
         snapshot.phase = actionLabel(snapshot.action);
-        pushOsd({ label: "执行中", command: liveText(snapshot), done: false }, false);
+        // label 显示具体动作（运行命令/读文件/搜索），command 继续滚思考
+        pushOsd({ label: actionLabel(snapshot.action), command: currentCommand(snapshot), done: false }, false);
         return;
       }
 
       if (type === "tool/result") {
         snapshot.phase = "执行中";
-        pushOsd({ label: "执行中", command: liveText(snapshot), done: false }, false);
+        pushOsd({ label: "执行中", command: currentCommand(snapshot), done: false }, false);
         return;
       }
 
@@ -734,7 +751,7 @@ export function apply(ctx: ContextLike, config?: Config): void {
         snapshot.todos = todos.filter(
           (item) => item && typeof item.content === "string" && typeof item.status === "string",
         );
-        pushOsd({ label: "执行中", command: liveText(snapshot), done: false }, false);
+        pushOsd({ label: "执行中", command: currentCommand(snapshot), done: false }, false);
         return;
       }
 
