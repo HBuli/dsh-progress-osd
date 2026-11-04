@@ -21,7 +21,7 @@
  *
  * 环境变量（都可选）：
  *   DSH_OSD_DEBOUNCE_MS  思考停顿多久才推，默认 4000
- *   DSH_OSD_MAX_CHARS    推出去的文本上限，默认 50（超出截断并加 "..."）
+ *   DSH_OSD_MAX_CHARS    推出去的文本上限，默认 400；设 0 表示完全不截断
  *   DSH_OSD_NOTIFY       默认 0；1 打开桌面通知
  *   DSH_OSD_NOTIFY_LIVE  默认 0；1 表示运行中也弹通知
  *   DSH_OSD_SOUND        默认 1；一轮结束播放提示音
@@ -37,7 +37,8 @@ export const name = "dsh-progress-osd";
 export const inject = [];
 const APP_NAME = "DSH 思考";
 const ICON = "utilities-terminal";
-const DEFAULT_MAX_CHARS = 50;
+// 顶栏是跑马灯，长句能自己滚，所以上限放宽到 400；0 = 不截断
+const DEFAULT_MAX_CHARS = 400;
 /* ------------------------------------------------------------------ *
  * 小工具
  * ------------------------------------------------------------------ */
@@ -69,7 +70,7 @@ function truncateChars(value, limit) {
  *   1. 去掉代码块（思考里常带示例代码，占满顶栏没意义）
  *   2. 换行/制表/连续空白 → 单个空格（顶栏是单行跑马灯）
  *   3. 去掉包裹的引号
- *   4. 超过 maxChars 个字符直接截断，补 " ..."
+ *   4. maxChars > 0 且超长时才截断，补 " ..."；maxChars <= 0 表示不截断
  */
 export function cleanThought(raw, maxChars = DEFAULT_MAX_CHARS) {
     let text = String(raw ?? "")
@@ -88,7 +89,7 @@ export function cleanThought(raw, maxChars = DEFAULT_MAX_CHARS) {
     if (!text)
         return "";
     const chars = Array.from(text);
-    if (chars.length > maxChars) {
+    if (maxChars > 0 && chars.length > maxChars) {
         return `${chars.slice(0, maxChars).join("").trimEnd()} ...`;
     }
     return text;
@@ -236,7 +237,7 @@ function resolveConfig(config, logger) {
     const resolved = {
         // 3–5 秒是体感合适的区间；下限 500ms 方便自测，上限 60s 防止手滑写错
         thoughtDebounceMs: clampInt(debounceRaw, 4000, 500, 60000),
-        maxChars: clampInt(maxCharsRaw, DEFAULT_MAX_CHARS, 10, 200),
+        maxChars: clampInt(maxCharsRaw, DEFAULT_MAX_CHARS, 0, 4000),
         notify: envFlag(env.DSH_OSD_NOTIFY, cfg.notify ?? false),
         notifyLive: envFlag(env.DSH_OSD_NOTIFY_LIVE, cfg.notifyLive ?? false),
         minNotifyGapMs: clampInt(cfg.minNotifyGapMs, 20000, 1000, 600000),
@@ -249,7 +250,7 @@ function resolveConfig(config, logger) {
         title: (env.DSH_OSD_TITLE ?? cfg.title ?? APP_NAME).trim() || APP_NAME,
     };
     if (resolved.maxChars !== DEFAULT_MAX_CHARS) {
-        logger?.info?.(`dsh-progress-osd: 文本上限 ${resolved.maxChars} 字`);
+        logger?.info?.(`dsh-progress-osd: 文本上限 ${resolved.maxChars > 0 ? `${resolved.maxChars} 字` : "不截断"}`);
     }
     return resolved;
 }
@@ -452,7 +453,7 @@ export function apply(ctx, config) {
         }
         if (progress)
             parts.push(progress);
-        return truncateChars(parts.join(" · "), 44);
+        return truncateChars(parts.join(" · "), 160);
     }
     /**
      * 顶栏只有一行，信息量最大的内容是「模型在想什么」。
