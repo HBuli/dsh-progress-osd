@@ -522,30 +522,21 @@ export function apply(ctx, config) {
         fallback();
     }
     /* ---------------- 即时本地文本（工具动作，零网络） ---------------- */
+    /**
+     * 动作行：只给「详情 · 待办」，动作词已经由 label 显示了，
+     * 再拼一遍就变成「运行 | 运行 · 找 foo」这种重复。
+     */
     function liveText(snapshot) {
+        const detail = snapshot.detail ? truncateChars(flatten(snapshot.detail, 40), 40) : "";
         const progress = todoProgress(snapshot);
-        const parts = [];
-        if (snapshot.action) {
-            const label = actionLabel(snapshot.action);
-            parts.push(snapshot.detail ? `${label} · ${truncateChars(snapshot.detail, 28)}` : label);
-        }
-        else if (snapshot.lastText) {
-            parts.push(truncateChars(flatten(snapshot.lastText, 24), 24));
-        }
-        else {
-            parts.push("处理中");
-        }
-        if (progress)
-            parts.push(progress);
-        return truncateChars(parts.join(" · "), 160);
+        return [detail, progress].filter(Boolean).join(" · ");
     }
     /**
-     * 顶栏只有一行，信息量最大的内容是「模型在想什么」。
-     * 所以一旦有思考文本，command 就常驻它（跑马灯慢慢滚），工具动作只去换 label；
-     * 没有思考文本（模型无 reasoning 通道）时才退回本地拼装的动作文本。
+     * 动作优先：正在跑工具就显示它的一句话说明（description），
+     * 没有动作（思考阶段）才显示思考的第一行。
      */
     function currentCommand(snapshot) {
-        return snapshot.thought || liveText(snapshot);
+        return liveText(snapshot) || snapshot.thought;
     }
     function todoProgress(snapshot) {
         if (snapshot.todos.length === 0)
@@ -588,7 +579,8 @@ export function apply(ctx, config) {
             const text = snapshot.thought;
             if (!text)
                 return;
-            pushOsd({ label: "思考中", command: text, done: false }, false);
+            // 思考到点推送时，若模型已经调了工具，动作行优先，别把思考盖回去
+            pushOsd({ label: "思考中", command: currentCommand(snapshot), done: false }, false);
             if (cfg.notifyLive)
                 notifyThrottled(text);
         }
@@ -740,6 +732,8 @@ export function apply(ctx, config) {
             if (type === "step/start") {
                 snapshot.step = Number(data.step ?? snapshot.step);
                 snapshot.phase = "思考中";
+                snapshot.action = "";
+                snapshot.detail = "";
                 pushOsd({ label: "思考中", command: currentCommand(snapshot), done: false }, false);
                 return;
             }
@@ -762,7 +756,8 @@ export function apply(ctx, config) {
                         : "")
                         .join(" "), 400);
                 }
-                // 先让工具动作的即时文本落一下，再排队思考（思考停顿 4s 后覆盖它）
+                snapshot.action = "";
+                snapshot.detail = "";
                 if (absorbThought(snapshot, data))
                     scheduleThoughtPush();
                 return;

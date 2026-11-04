@@ -34,7 +34,7 @@ export type AssistantStreamRecord = { type: 'reasoning-chunks'; index: number; t
 - **清洗**：去代码块 → 换行/连续空白压成单个空格 → 去包裹引号。
 - **取首行**：和 DSH 网页上的思考行一致——只取 reasoning 的第一行（模型给自己写的主题句），不是整段；首行过短时并上下一行。
 - **截断**：`maxChars` 默认 60，超长补 `" ..."`；设 0 表示完全不截断。
-- **动作详情**：优先用模型给工具调用写的 `description`（网页上显示的就是它），没有才退回原始参数。
+- **动作优先**：正在跑工具时 command 显示该工具的 `description`（网页上显示的就是它），没有才退回原始参数；只有在思考阶段（没有工具在跑）才显示思考首行。
 - **兜底**：模型没有 reasoning 通道时（`fallbackToText: true`），回退到同一 stream 的 `text-chunks`，再不行读 `message.content`。
 
 ## 3. 安装
