@@ -1,6 +1,6 @@
 {
   "name": "dsh-progress-osd",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "把 DSH 会话的模型思考（reasoning）实时推到 customshell 顶栏 OSD：零联网、零 API 成本",
   "type": "module",
