@@ -32,7 +32,9 @@ export type AssistantStreamRecord = { type: 'reasoning-chunks'; index: number; t
 
 - **trailing debounce**：每来一段新思考就重置计时器，静默满 `thoughtDebounceMs`（默认 4000ms）才推**最新一条**。连续吐字时不会刷屏。
 - **清洗**：去代码块 → 换行/连续空白压成单个空格 → 去包裹引号。
-- **截断**：`maxChars` 默认 400，超长才截断补 `" ..."`；设 0 表示完全不截断（顶栏是跑马灯，长句能自己滚）。
+- **取首行**：和 DSH 网页上的思考行一致——只取 reasoning 的第一行（模型给自己写的主题句），不是整段；首行过短时并上下一行。
+- **截断**：`maxChars` 默认 60，超长补 `" ..."`；设 0 表示完全不截断。
+- **动作详情**：优先用模型给工具调用写的 `description`（网页上显示的就是它），没有才退回原始参数。
 - **兜底**：模型没有 reasoning 通道时（`fallbackToText: true`），回退到同一 stream 的 `text-chunks`，再不行读 `message.content`。
 
 ## 3. 安装
@@ -74,7 +76,7 @@ dsh plugin --profile web remove dsh-osd-progress
 | 键 / 环境变量 | 默认 | 说明 |
 |---|---|---|
 | `thoughtDebounceMs` / `DSH_OSD_DEBOUNCE_MS` | `4000` | 思考停顿多久才推 |
-| `maxChars` / `DSH_OSD_MAX_CHARS` | `400` | 文本上限，超出截断加 `...`；`0` = 不截断 |
+| `maxChars` / `DSH_OSD_MAX_CHARS` | `60` | 文本上限，超出截断加 `...`；`0` = 不截断 |
 | `notify` / `DSH_OSD_NOTIFY` | `false` | 是否弹系统 toast |
 | `notifyLive` / `DSH_OSD_NOTIFY_LIVE` | `false` | 运行中也弹 toast |
 | `sound` / `DSH_OSD_SOUND` | `true` | 一轮结束播放提示音 |

@@ -40,7 +40,7 @@ export const inject: string[] = [];
 const APP_NAME = "DSH 思考";
 const ICON = "utilities-terminal";
 // 顶栏是跑马灯，长句能自己滚，所以上限放宽到 400；0 = 不截断
-const DEFAULT_MAX_CHARS = 400;
+const DEFAULT_MAX_CHARS = 60;
 
 /* ------------------------------------------------------------------ *
  * 类型（自包含，不 import DSH 内部类型包：link 进 profile 后解析不到）
@@ -167,6 +167,13 @@ function flatten(value: unknown, limit: number): string {
   return truncateChars(text, limit);
 }
 
+/** 截断并补 " ..."；limit <= 0 表示不截断 */
+function truncateWithEllipsis(value: string, limit: number): string {
+  if (limit <= 0) return value;
+  const chars = Array.from(value);
+  return chars.length > limit ? `${chars.slice(0, limit).join("").trimEnd()} ...` : value;
+}
+
 function truncateChars(value: string, limit: number): string {
   const chars = Array.from(value);
   return chars.length > limit ? chars.slice(0, limit).join("") : value;
@@ -180,6 +187,33 @@ function truncateChars(value: string, limit: number): string {
  *   4. maxChars > 0 且超长时才截断，补 " ..."；maxChars <= 0 表示不截断
  */
 export function cleanThought(raw: string, maxChars = DEFAULT_MAX_CHARS): string {
+  const line = firstMeaningfulLine(raw);
+  if (!line) return "";
+  return truncateWithEllipsis(tidyThought(line), maxChars);
+}
+
+/**
+ * 取「第一行有意义的话」——DSH 网页上的思考行就是这么显示的：
+ * 模型给自己写的主题句，通常十几个字，比截整段的任意位置都更贴题。
+ * 首行过短（如「好，」）时并上下一行，免得顶栏只剩两个字。
+ */
+function firstMeaningfulLine(raw: string): string {
+  const lines = String(raw ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return "";
+  let out = lines[0];
+  let i = 1;
+  while (Array.from(out).length < 6 && i < lines.length) {
+    out = `${out} ${lines[i]}`;
+    i += 1;
+  }
+  return out;
+}
+
+/** 去代码块 / markdown 标记 / 换行，压成一行纯文本。 */
+function tidyThought(raw: string): string {
   let text = String(raw ?? "")
     .replace(/```[\s\S]*?```/g, " ")
     .replace(/[\r\n\t]+/g, " ")
@@ -192,13 +226,7 @@ export function cleanThought(raw: string, maxChars = DEFAULT_MAX_CHARS): string 
     .replace(/(^|\s)[-*+]\s+/g, " ")
     .replace(/\s{2,}/g, " ")
     .trim();
-  text = text.replace(/^["'“”‘’「」]+|["'“”‘’「」]+$/g, "").trim();
-  if (!text) return "";
-  const chars = Array.from(text);
-  if (maxChars > 0 && chars.length > maxChars) {
-    return `${chars.slice(0, maxChars).join("").trimEnd()} ...`;
-  }
-  return text;
+  return text.replace(/^["'“”‘’「」]+|["'“”‘’「」]+$/g, "").trim();
 }
 
 interface StreamRecordLike {
@@ -327,12 +355,15 @@ function shortDetail(tool: string, rawArguments: unknown): string {
     args = rawArguments as Record<string, unknown>;
   }
 
+  // 模型给每个工具调用写了一句 description（网页上显示的就是它），优先用
+  if (typeof args.description === "string" && args.description.trim()) {
+    return flatten(args.description, 40);
+  }
   if (typeof args.command === "string") return flatten(args.command, 60);
   if (typeof args.file_path === "string") return flatten(path.basename(args.file_path), 40);
   if (typeof args.path === "string") return flatten(path.basename(args.path), 40);
   if (typeof args.pattern === "string") return flatten(args.pattern, 40);
   if (typeof args.query === "string") return flatten(args.query, 40);
-  if (typeof args.description === "string") return flatten(args.description, 40);
   if (typeof args.url === "string") return flatten(args.url, 60);
   return "";
 }
