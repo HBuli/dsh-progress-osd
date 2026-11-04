@@ -3,7 +3,9 @@
 把 DSH 会话的进度**概括成一句中文**，同时推到两处：
 
 1. **customshell 顶栏 OSD**：`~/.cache/dsh-osd.json`（协议见 `customshell-arch-config/dsh/OSD-PROTOCOL.md`）
-2. **桌面通知**：`notify-send`（mako）
+2. **收尾提示音**：`paplay complete.oga`（找不到文件时退回 `canberra-gtk-play`）
+
+系统 toast 默认关闭（`notify: false`）：进度只占顶栏，不打断你做别的事。
 
 概括走 DeepSeek（`deepseek-chat`），带 5 秒防抖、固定 system prompt（命中前缀缓存）、8 秒超时；API 挂了自动降级为本地拼装的文本，功能不中断。
 
@@ -56,8 +58,10 @@ dsh plugin --profile web remove dsh-osd-progress
         model: deepseek-chat
         debounceMs: 5000    # 硬性下限 5000，调小会被压回 5 秒
         maxChars: 30
-        notify: true
-        notifyLive: false   # true = 运行中也弹通知（默认只在 turn/end 弹）
+        notify: false       # 系统 toast，默认关（只要顶栏 + 提示音时不用动）
+        notifyLive: false   # true = 运行中也弹通知
+        sound: true         # 一轮结束时播提示音
+        soundFile: /usr/share/sounds/freedesktop/stereo/complete.oga
 ```
 
 | 环境变量 | 作用 | 默认 |
@@ -66,7 +70,9 @@ dsh plugin --profile web remove dsh-osd-progress
 | `DEEPSEEK_BASE_URL` | 兼容自建网关 | `https://api.deepseek.com` |
 | `DSH_OSD_MODEL` | 覆盖模型 | `deepseek-chat` |
 | `DSH_OSD_DEBOUNCE_MS` | 防抖时间（下限 5000） | 5000 |
-| `DSH_OSD_NOTIFY` | `0` 关闭桌面通知 | 开 |
+| `DSH_OSD_NOTIFY` | `1` 打开系统 toast（默认关） | 关 |
+| `DSH_OSD_SOUND` | `0` 关闭收尾提示音 | 开 |
+| `DSH_OSD_SOUND_FILE` | 提示音文件路径 | `complete.oga` |
 | `DSH_OSD_NOTIFY_LIVE` | `1` 运行中也弹通知 | 0 |
 | `DSH_OSD_FILE` | OSD 文件路径 | `~/.cache/dsh-osd.json` |
 | `DSH_OSD_KEY` | 自己的 OSD key | `dsh-<pid>` |
@@ -117,11 +123,13 @@ export function apply(ctx: ContextLike, config?: Config): void {
 
 | 事件 | 顶栏 label | 说明 |
 |---|---|---|
-| `turn/start` | 思考中 | 重置快照，`since=now` |
-| `step/start` / `step/end` | 思考中 | 步数 +1，触发防抖概括 |
-| `tool/call` | 运行命令 / 改文件 / 搜索 … | 从 tool 名映射 ≤4 字动作词 |
-| `todo/write` | 沿用 | 记录 todos，句末可补「待办 2/5」 |
-| `turn/end` | 任务已完成 | **强制**调一次概括 + 弹通知，3 秒后删 key |
+| `turn/start` | 思考中 | 重置快照、command 清空，`since=now` |
+| `step/start` | 思考中 | 步数 +1，等待模型开口 |
+| `tool/call` | 执行中 | command 立刻写「动作词 · 参数」，不等模型 |
+| `tool/result` | 执行中 | 保持执行态，别急着跳回思考 |
+| `assistant/message` | 执行中 | command 跟随模型正在写的内容 |
+| `todo/write` | 执行中 | 记录 todos，句末补「待办 2/5」 |
+| `turn/end` | 任务已完成 | **立即**本地收尾 + 提示音；模型概括后台补，3 秒后删 key |
 | `agent/status=idle` | 任务已完成 | 6 秒无事件时的兜底收尾 |
 
 ---

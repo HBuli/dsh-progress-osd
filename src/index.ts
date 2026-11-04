@@ -96,6 +96,10 @@ export interface Config {
   notify?: boolean;
   notifyLive?: boolean;
   minNotifyGapMs?: number;
+  /** 一轮结束时播放提示音（默认 true） */
+  sound?: boolean;
+  /** 提示音文件，默认 freedesktop 的 complete.oga；设为空串则改用 canberra 音效名 */
+  soundFile?: string;
   doneHoldMs?: number;
   pollUrl?: string;
   pollIntervalMs?: number;
@@ -112,6 +116,8 @@ interface ResolvedConfig {
   notify: boolean;
   notifyLive: boolean;
   minNotifyGapMs: number;
+  sound: boolean;
+  soundFile: string;
   doneHoldMs: number;
   pollUrl: string;
   pollIntervalMs: number;
@@ -134,6 +140,8 @@ interface Snapshot {
   updatedAt: number;
   done: boolean;
   endReason: string;
+  /** 收尾态（OSD done + 提示音）是否已经推过，避免网络回来后再推一次 */
+  doneNotified: boolean;
 }
 
 /* ------------------------------------------------------------------ *
@@ -178,9 +186,15 @@ function resolveConfig(config: Config | undefined, logger?: LoggerLike): Resolve
     // 硬性下限 5000：需求要求「至少 5 秒防抖」，配置调小也压回 5s，避免把 API 打爆
     debounceMs: clampInt(debounceRaw, 5000, 5000, 120000),
     maxChars: clampInt(cfg.maxChars, 30, 10, 80),
-    notify: envFlag(env.DSH_OSD_NOTIFY, cfg.notify ?? true),
+    // 默认不弹系统 toast：进度只在顶栏 OSD 展示，收尾用提示音提醒
+    notify: envFlag(env.DSH_OSD_NOTIFY, cfg.notify ?? false),
     notifyLive: envFlag(env.DSH_OSD_NOTIFY_LIVE, cfg.notifyLive ?? false),
     minNotifyGapMs: clampInt(cfg.minNotifyGapMs, 5000, 1000, 600000),
+    sound: envFlag(env.DSH_OSD_SOUND, cfg.sound ?? true),
+    soundFile:
+      env.DSH_OSD_SOUND_FILE ??
+      cfg.soundFile ??
+      "/usr/share/sounds/freedesktop/stereo/complete.oga",
     doneHoldMs: clampInt(cfg.doneHoldMs, 3000, 500, 30000),
     pollUrl:
       env.DSH_OSD_POLL_URL ??
@@ -531,6 +545,7 @@ export function apply(ctx: ContextLike, config?: Config): void {
       updatedAt: now,
       done: false,
       endReason: "",
+      doneNotified: false,
     };
   }
 
@@ -647,7 +662,47 @@ export function apply(ctx: ContextLike, config?: Config): void {
     notifySend(APP_NAME, text);
   }
 
-  /* ---------------- 概括 ---------------- */
+  /* ---------------- 提示音 ---------------- */
+  function playDoneSound(): void {
+    if (!cfg.sound) return;
+    // 只用 execFile 传参数数组：不经过 shell，文件名里的空格/引号都不会变成命令
+    const file = cfg.soundFile;
+    const fallback = (): void => {
+      execFile("canberra-gtk-play", ["-i", "complete"], { timeout: 2000 }, () => {});
+    };
+    try {
+      if (file && fs.existsSync(file)) {
+        execFile("paplay", [file], { timeout: 2000 }, (error) => {
+          if (error) fallback();
+        });
+        return;
+      }
+    } catch {
+      // 文件探测失败直接走 canberra
+    }
+    fallback();
+  }
+
+  /* ---------------- 即时本地文本（不等模型） ---------------- */
+  /**
+   * 事件到达的瞬间就先给顶栏一句话：只有本地拼装，零网络。
+   * 5 秒后模型概括回来再覆盖它，所以进度永远「先到一步」。
+   */
+  function liveText(snapshot: Snapshot): string {
+    const progress = todoProgress(snapshot);
+    const parts: string[] = [];
+    if (snapshot.action) {
+      const label = actionLabel(snapshot.action);
+      parts.push(snapshot.detail ? `${label} · ${truncateChars(snapshot.detail, 28)}` : label);
+    } else if (snapshot.lastText) {
+      parts.push(truncateChars(flatten(snapshot.lastText, 24), 24));
+    } else {
+      parts.push("处理中");
+    }
+    if (progress) parts.push(progress);
+    return truncateChars(parts.join(" · "), 44);
+  }
+
   function buildSnapshotJson(snapshot: Snapshot, stage: "running" | "done"): string {
     const payload: Record<string, unknown> = {
       stage,
@@ -672,14 +727,22 @@ export function apply(ctx: ContextLike, config?: Config): void {
   function publishRunning(snapshot: Snapshot, text: string): void {
     snapshot.summary = text;
     lastSummary = text;
-    pushOsd({ label: actionLabel(snapshot.action) || snapshot.phase, command: text, done: false }, false);
+    // label 固定两态，动作细节在 command 里，避免「思考中/执行中」来回跳
+    pushOsd({ label: "执行中", command: text, done: false }, false);
   }
 
   function publishDone(snapshot: Snapshot, text: string): void {
     snapshot.summary = text;
     // 不写 lastSummary：否则下一轮 turn/start 会把「已完成」这类收尾语当作 command 顶上去
+    if (snapshot.doneNotified) {
+      // 已经收尾过了（本地先推、模型后到）：OSD 保持不变，只记录更凝练的一版
+      logger?.info?.(`dsh-progress-osd: 本轮概括 ${text}`);
+      return;
+    }
+    snapshot.doneNotified = true;
     pushOsd({ label: "任务已完成", command: "", done: true }, false);
     notifySend(APP_NAME, text);
+    playDoneSound();
     if (doneTimer) clearTimeout(doneTimer);
     doneTimer = setTimeout(() => {
       doneTimer = null;
@@ -747,7 +810,9 @@ export function apply(ctx: ContextLike, config?: Config): void {
   }
 
   function scheduleSummarize(): void {
-    if (debounceTimer) clearTimeout(debounceTimer);
+    // 关键：不重置计时器。否则连续动作（每几秒一个 tool）会把 5 秒一推再推，
+    // 概括永远等不到窗口，表现就是「活都干完了才冒出一句话」。
+    if (debounceTimer) return;
     debounceTimer = setTimeout(() => {
       debounceTimer = null;
       void summarize("running");
@@ -774,14 +839,15 @@ export function apply(ctx: ContextLike, config?: Config): void {
           clearTimeout(doneTimer);
           doneTimer = null;
         }
-        pushOsd({ label: "思考中", command: lastSummary, done: false }, true);
+        // 新一轮从干净状态起步，不要拿上一轮的摘要顶上（那正是「看着像没动」的来源）
+        pushOsd({ label: "思考中", command: "", done: false }, true);
         return;
       }
 
       if (type === "step/start") {
         snapshot.step = Number(data.step ?? snapshot.step);
         snapshot.phase = "思考中";
-        pushOsd({ label: "思考中", command: snapshot.summary || lastSummary, done: false }, false);
+        pushOsd({ label: "思考中", command: liveText(snapshot), done: false }, false);
         return;
       }
 
@@ -794,14 +860,16 @@ export function apply(ctx: ContextLike, config?: Config): void {
         snapshot.action = typeof data.name === "string" ? data.name : "";
         snapshot.detail = shortDetail(snapshot.action, data.arguments);
         snapshot.phase = actionLabel(snapshot.action);
-        pushOsd({ label: snapshot.phase, command: snapshot.summary || lastSummary, done: false }, false);
+        // label 只表达「在思考 / 在执行」，具体动作交给 command（那里有空格跑马灯）
+        pushOsd({ label: "执行中", command: liveText(snapshot), done: false }, false);
         scheduleSummarize();
         return;
       }
 
       if (type === "tool/result") {
-        snapshot.phase = "思考中";
-        pushOsd({ label: "思考中", command: snapshot.summary || lastSummary, done: false }, false);
+        // 工具刚跑完、模型还在看结果：整段都算执行阶段，别急着切回「思考中」
+        snapshot.phase = "执行中";
+        pushOsd({ label: "执行中", command: liveText(snapshot), done: false }, false);
         scheduleSummarize();
         return;
       }
@@ -811,6 +879,7 @@ export function apply(ctx: ContextLike, config?: Config): void {
         snapshot.todos = todos.filter(
           (item) => item && typeof item.content === "string" && typeof item.status === "string",
         );
+        pushOsd({ label: "执行中", command: liveText(snapshot), done: false }, false);
         scheduleSummarize();
         return;
       }
@@ -829,6 +898,8 @@ export function apply(ctx: ContextLike, config?: Config): void {
             .join(" ");
           snapshot.lastText = flatten(joined, 400);
         }
+        // 模型一旦开始产出内容，就是「事情在推进」，按执行态展示；真正没开口才是思考中
+        if (!snapshot.done) pushOsd({ label: "执行中", command: liveText(snapshot), done: false }, false);
         return;
       }
 
@@ -840,7 +911,8 @@ export function apply(ctx: ContextLike, config?: Config): void {
           clearTimeout(debounceTimer);
           debounceTimer = null;
         }
-        // 一轮结束强制概括 + 推送最终结果
+        // 关键：本地兜底文本 + 提示音立刻落地（不等网络），模型概括随后补发
+        publishDone(snapshot, fallbackSummary(snapshot, "done", cfg.maxChars));
         void summarize("done", { force: true });
         return;
       }
@@ -863,6 +935,8 @@ export function apply(ctx: ContextLike, config?: Config): void {
         if (idleAt < latest.startedAt) return;
         latest.done = true;
         latest.endReason = "idle";
+        // 同样先本地收尾（含提示音），模型概括在后台补
+        publishDone(latest, fallbackSummary(latest, "done", cfg.maxChars));
         void summarize("done", { force: true });
       }, 6000).unref?.();
     } catch (error) {
