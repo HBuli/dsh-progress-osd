@@ -568,11 +568,15 @@ export function apply(ctx, config) {
         }
     }
     /* ---------------- 收尾 ---------------- */
-    function publishDone(snapshot, text) {
+    /**
+     * @param costText 本轮花费（如 "¥0.0313"）。收尾时先立刻读一次账本，
+     *                 读到就一次性写入，避免顶栏先显示短文案再被金额改写（翻页两次）。
+     */
+    function publishDone(snapshot, text, costText = "") {
         if (snapshot.doneNotified)
             return;
         snapshot.doneNotified = true;
-        pushOsd({ label: "任务已完成", command: "", done: true }, false);
+        pushOsd({ label: "任务已完成", command: costText, done: true }, false);
         notifySend(cfg.title, text);
         playDoneSound();
         if (doneTimer)
@@ -583,40 +587,53 @@ export function apply(ctx, config) {
         }, cfg.doneHoldMs);
         doneTimer.unref?.();
     }
+    /** 算出本轮花费文本；读不到 / 没涨钱 / 关闭了 showCost 都返回空串。 */
+    async function turnCostText(sessionId) {
+        if (!cfg.showCost)
+            return "";
+        const total = await readSessionCost(cfg.costLedgerFile, sessionId, cfg.costCurrency);
+        if (total == null)
+            return "";
+        const base = turnBaselineCost;
+        const spent = base != null ? Math.max(0, total - base) : total;
+        if (!(spent > 0))
+            return "";
+        return formatCost(spent, cfg.costCurrency);
+    }
     /**
-     * 一轮结束后把花费补进完成提示。
-     * 账本是 cost-meter 在每次 API 调用后写的，turn/end 当下可能还没落盘，
-     * 所以等 1.2 秒再读一次；读不到就什么都不改（顶栏只显示「任务已完成」）。
+     * 兜底补金额：收尾那一刻账本还没落盘（cost-meter 是异步写）时用。
+     * 每 500ms 重试一次，最多 3 次；一旦拿到就写一次并停手。
      */
     function attachCost(sessionId) {
         if (!cfg.showCost)
             return;
         const startedAt = Date.now();
-        const delay = Math.min(1200, Math.max(0, cfg.doneHoldMs - 1200));
-        const timer = setTimeout(() => {
-            void (async () => {
-                try {
-                    const total = await readSessionCost(cfg.costLedgerFile, sessionId, cfg.costCurrency);
-                    if (total == null)
-                        return;
-                    const base = turnBaselineCost;
-                    const spent = base != null ? Math.max(0, total - base) : total;
-                    if (!(spent > 0))
-                        return;
-                    // 停留时间快过了就别再写，免得把已删除的 key 又写回来
-                    if (Date.now() - startedAt > Math.max(500, cfg.doneHoldMs - 400))
-                        return;
-                    const snapshot = sessions.get(sessionId);
-                    if (!snapshot?.done)
-                        return;
-                    pushOsd({ label: "任务已完成", command: formatCost(spent, cfg.costCurrency), done: true }, false);
-                }
-                catch (error) {
-                    logger?.warn?.(`dsh-progress-osd: 读取花费失败: ${error?.message ?? String(error)}`);
-                }
-            })();
-        }, delay);
-        timer.unref?.();
+        let tries = 0;
+        const attempt = () => {
+            tries += 1;
+            const timer = setTimeout(() => {
+                void (async () => {
+                    try {
+                        const costText = await turnCostText(sessionId);
+                        const snapshot = sessions.get(sessionId);
+                        if (costText && snapshot?.done) {
+                            // 停留时间快过了就别再写，免得把已删除的 key 又写回来
+                            if (Date.now() - startedAt > Math.max(500, cfg.doneHoldMs - 400))
+                                return;
+                            pushOsd({ label: "任务已完成", command: costText, done: true }, false);
+                            return;
+                        }
+                        if (tries < 3 && snapshot?.done)
+                            attempt();
+                    }
+                    catch (error) {
+                        logger?.warn?.(`dsh-progress-osd: 读取花费失败: ${error?.message ?? String(error)}`);
+                    }
+                })();
+            }, 500);
+            timer.unref?.();
+        };
+        attempt();
     }
     /* ---------------- 事件 ---------------- */
     /**
@@ -750,8 +767,16 @@ export function apply(ctx, config) {
                 }
                 // 收尾文本：优先用本段最后的思考，其次本地规则兜底（都不联网）
                 const finalText = snapshot.thought || fallbackSummary(snapshot, "done");
-                publishDone(snapshot, finalText);
-                attachCost(sessionId);
+                // 先立刻读一次账本（几毫秒）：读到金额就和完成文案一起写，避免翻页两次
+                void (async () => {
+                    const costText = await turnCostText(sessionId);
+                    // 读账本期间已经开了新一轮，就别把上一轮的完成态顶上去
+                    if (sessions.get(sessionId) !== snapshot)
+                        return;
+                    publishDone(snapshot, finalText, costText);
+                    if (!costText)
+                        attachCost(sessionId);
+                })();
                 return;
             }
         }
@@ -775,7 +800,16 @@ export function apply(ctx, config) {
                     return;
                 latest.done = true;
                 latest.endReason = "idle";
-                publishDone(latest, latest.thought || fallbackSummary(latest, "done"));
+                const text = latest.thought || fallbackSummary(latest, "done");
+                void (async () => {
+                    const costText = await turnCostText(activeSessionId);
+                    const current = activeSnapshot();
+                    if (current !== latest)
+                        return;
+                    publishDone(latest, text, costText);
+                    if (!costText)
+                        attachCost(activeSessionId);
+                })();
             }, 6000).unref?.();
         }
         catch (error) {
