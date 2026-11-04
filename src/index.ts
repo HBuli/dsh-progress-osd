@@ -277,8 +277,10 @@ function pruneStaleEntries(file: string, logger?: LoggerLike): void {
 /* ------------------------------------------------------------------ *
  * 工具动作 → 中文动作词 / 简短详情
  * ------------------------------------------------------------------ */
+// 顶栏左侧状态词的位置是固定宽度的，最多放 3 个汉字（14px 字号）。
+// 所以这里全部压到 3 字以内，宁可短一点也不要出现「运行…」这种省略号。
 const ACTION_LABELS: Record<string, string> = {
-  bash: "运行命令",
+  bash: "运行",
   read: "读文件",
   write: "写文件",
   edit: "改文件",
@@ -289,9 +291,9 @@ const ACTION_LABELS: Record<string, string> = {
   todo: "理待办",
   web_search: "搜网页",
   web_fetch: "抓网页",
-  task: "派子任务",
-  subagent: "派子任务",
-  ask_user_question: "等你确认",
+  task: "派任务",
+  subagent: "派任务",
+  ask_user_question: "等确认",
   skill: "载技能",
 };
 
@@ -299,7 +301,8 @@ function actionLabel(tool: string): string {
   if (!tool) return "执行中";
   const mapped = ACTION_LABELS[tool];
   if (mapped) return mapped;
-  return truncateChars(tool.replace(/[_/-]+/g, " ").trim() || "执行中", 6);
+  const cleaned = tool.replace(/[_/-]+/g, " ").trim();
+  return truncateChars(cleaned || "执行中", 3);
 }
 
 function shortDetail(tool: string, rawArguments: unknown): string {
