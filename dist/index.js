@@ -103,6 +103,10 @@ function resolveConfig(config, logger) {
         pollIntervalMs: clampInt(cfg.pollIntervalMs, 5000, 1000, 60000),
         osdFile: env.DSH_OSD_FILE ?? path.join(os.homedir(), ".cache", "dsh-osd.json"),
         osdKey: env.DSH_OSD_KEY ?? `dsh-${process.pid}`,
+        // DSH 自己的凭据库：DEEPSEEK_API_KEY 就存在这里的 refs 段
+        credentialsFile: env.DSH_OSD_CREDENTIALS ??
+            cfg.credentialsFile ??
+            path.join(env.DSH_HOME ?? path.join(os.homedir(), ".dsh"), ".credentials.yaml"),
     };
 }
 function readOsdState(file) {
@@ -234,10 +238,67 @@ function sanitizeModelText(raw) {
         text = text.slice(0, cut);
     return text.trim();
 }
+/**
+ * 找 API key 的优先链：进程环境变量 → DSH 自己的凭据库（~/.dsh/.credentials.yaml）。
+ *
+ * DSH 把在设置面板里填的 key 存在凭据文件里（refs.DEEPSEEK_API_KEY），并不会导出到
+ * 子进程环境，所以插件光读 process.env 是拿不到的。这里直接复用同一个 key：
+ * 用户在 DSH 里配一次，插件就能跟着用，不需要再单独配一份。
+ *
+ * 只做「refs 段里找同名键」的行级解析，不引入 YAML 依赖；解析失败静默返回空串。
+ */
+let keyCache = null;
+function keyFromCredentialsFile(file) {
+    try {
+        const text = fs.readFileSync(file, "utf8");
+        let inRefs = false;
+        for (const line of text.split(/\r?\n/)) {
+            if (/^refs:\s*$/.test(line)) {
+                inRefs = true;
+                continue;
+            }
+            if (inRefs) {
+                if (/^\S/.test(line))
+                    inRefs = false; // 顶格的新键 = refs 段结束
+                else {
+                    const match = /^\s+([A-Za-z0-9_]+)\s*:\s*(.+?)\s*$/.exec(line);
+                    if (match && match[1] === "DEEPSEEK_API_KEY") {
+                        return match[2].replace(/^["']|["']$/g, "").trim();
+                    }
+                }
+            }
+            // 兼容 refs 写成单行内联对象的情况
+            const inline = /^\{?\s*DEEPSEEK_API_KEY\s*:\s*([^,}\s]+)/.exec(line);
+            if (!inRefs && inline)
+                return inline[1].replace(/^["']|["']$/g, "");
+        }
+    }
+    catch {
+        /* 文件不存在 / 没权限：静默降级 */
+    }
+    return "";
+}
+function resolveApiKey(cfg, logger) {
+    const fromEnv = (process.env.DEEPSEEK_API_KEY ?? "").trim();
+    if (fromEnv)
+        return fromEnv;
+    if (keyCache && Date.now() - keyCache.at < 60_000)
+        return keyCache.value;
+    const fromFile = keyFromCredentialsFile(cfg.credentialsFile);
+    keyCache = { value: fromFile, at: Date.now() };
+    if (fromFile) {
+        logger?.info?.(`dsh-progress-osd: 复用 DSH 凭据库里的 DEEPSEEK_API_KEY（${cfg.credentialsFile}）`);
+    }
+    return fromFile;
+}
 async function callDeepSeek(cfg, userContent, logger) {
-    const apiKey = (process.env.DEEPSEEK_API_KEY ?? "").trim();
-    if (!apiKey)
-        return { text: null, error: "DEEPSEEK_API_KEY 未设置" };
+    const apiKey = resolveApiKey(cfg, logger);
+    if (!apiKey) {
+        return {
+            text: null,
+            error: `DEEPSEEK_API_KEY 未设置（环境变量与 ${cfg.credentialsFile} 都没有）`,
+        };
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), cfg.apiTimeoutMs);
     timer.unref?.();

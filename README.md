@@ -62,7 +62,7 @@ dsh plugin --profile web remove dsh-osd-progress
 
 | 环境变量 | 作用 | 默认 |
 |---|---|---|
-| `DEEPSEEK_API_KEY` | API 密钥，**唯一必填** | 空 → 走兜底摘要 |
+| `DEEPSEEK_API_KEY` | 手动指定密钥，**优先级最高**（一般不用设） | 空 → 自动复用 DSH 凭据库 |
 | `DEEPSEEK_BASE_URL` | 兼容自建网关 | `https://api.deepseek.com` |
 | `DSH_OSD_MODEL` | 覆盖模型 | `deepseek-chat` |
 | `DSH_OSD_DEBOUNCE_MS` | 防抖时间（下限 5000） | 5000 |
@@ -71,6 +71,19 @@ dsh plugin --profile web remove dsh-osd-progress
 | `DSH_OSD_FILE` | OSD 文件路径 | `~/.cache/dsh-osd.json` |
 | `DSH_OSD_KEY` | 自己的 OSD key | `dsh-<pid>` |
 | `DSH_OSD_POLL_URL` | 轮询兜底接口，空串禁用 | `http://127.0.0.1:3080/agent-status/api/state` |
+| `DSH_OSD_CREDENTIALS` | DSH 凭据文件路径 | `$DSH_HOME/.credentials.yaml` |
+
+### 为什么不用单独配 key
+
+DSH 把设置面板里填的 key 存在 `~/.dsh/.credentials.yaml` 的 `refs.DEEPSEEK_API_KEY`，**并不导出到子进程环境**，所以只读 `process.env` 是拿不到的。本插件的取 key 顺序是：
+
+1. `process.env.DEEPSEEK_API_KEY`（临时覆盖用）
+2. `$DSH_HOME/.credentials.yaml` 的 `refs.DEEPSEEK_API_KEY`（**这就是 DSH 自己用的那把 key**）
+3. 都没有 → 本地兜底摘要，功能照常
+
+解析是行级的，不引入 YAML 依赖；结果缓存 60 秒，换 key 后最多一分钟后生效。也就是说：**DSH 能用，插件就能用**，不需要再配一份。
+
+> 另一种"继承"方式是直接调宿主的 `ctx.llm.stream()`（连 key 都不用碰），但那样会用会话当前的模型（通常比 `deepseek-chat` 贵得多），OSD 这种高频小任务不划算，所以没走这条路。
 
 > `agent-status` 接口在本机实测是 **404**：插件只会在「8 秒内没收到任何 SessionEvent」时才去探测，遇到 404/501 立刻停用（只留一条 info 日志），正常使用完全走事件流。
 
