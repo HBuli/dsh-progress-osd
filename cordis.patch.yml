@@ -18,8 +18,8 @@
         soundFile: /usr/share/sounds/freedesktop/stereo/complete.oga
         # 没有 reasoning 通道的模型回退到可见正文
         fallbackToText: true
-        # 完成态在顶栏停留 7 秒（默认也是 7 秒，这里写死方便一眼看到）
-        doneHoldMs: 7000
+        # 完成态在顶栏停留 10 秒（默认也是 10 秒，这里写死方便一眼看到）
+        doneHoldMs: 10000
         # 收尾时把本轮花费拼进完成提示（读 dsh-cost-meter 的账本，只读不联网）
         showCost: true
         costCurrency: CNY

@@ -246,7 +246,7 @@ function resolveConfig(config, logger) {
         minNotifyGapMs: clampInt(cfg.minNotifyGapMs, 20000, 1000, 600000),
         sound: envFlag(env.DSH_OSD_SOUND, cfg.sound ?? true),
         soundFile: soundFile || "/usr/share/sounds/freedesktop/stereo/complete.oga",
-        doneHoldMs: clampInt(process.env.DSH_OSD_DONE_HOLD_MS ?? cfg.doneHoldMs, 7000, 0, 60000),
+        doneHoldMs: clampInt(process.env.DSH_OSD_DONE_HOLD_MS ?? cfg.doneHoldMs, 10000, 0, 60000),
         fallbackToText: cfg.fallbackToText ?? true,
         osdFile: (env.DSH_OSD_FILE ?? cfg.osdFile ?? path.join(os.homedir(), ".cache", "dsh-osd.json")).trim(),
         osdKey: (env.DSH_OSD_KEY ?? cfg.osdKey ?? `dsh-${process.pid}`).trim(),
