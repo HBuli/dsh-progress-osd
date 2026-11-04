@@ -89,7 +89,7 @@ export interface Config {
   sound?: boolean;
   /** 提示音文件；设为空串则改用 canberra 音效名 */
   soundFile?: string;
-  /** 完成态在顶栏停留多久，默认 3000 */
+  /** 完成态在顶栏停留多久，默认 7000 */
   doneHoldMs?: number;
   /** 没有 reasoning 时是否回退到可见正文，默认 true */
   fallbackToText?: boolean;
@@ -356,7 +356,7 @@ function resolveConfig(config: Config | undefined, logger?: LoggerLike): Resolve
     minNotifyGapMs: clampInt(cfg.minNotifyGapMs, 20000, 1000, 600000),
     sound: envFlag(env.DSH_OSD_SOUND, cfg.sound ?? true),
     soundFile: soundFile || "/usr/share/sounds/freedesktop/stereo/complete.oga",
-    doneHoldMs: clampInt(process.env.DSH_OSD_DONE_HOLD_MS ?? cfg.doneHoldMs, 3000, 0, 60000),
+    doneHoldMs: clampInt(process.env.DSH_OSD_DONE_HOLD_MS ?? cfg.doneHoldMs, 7000, 0, 60000),
     fallbackToText: cfg.fallbackToText ?? true,
     osdFile: (env.DSH_OSD_FILE ?? cfg.osdFile ?? path.join(os.homedir(), ".cache", "dsh-osd.json")).trim(),
     osdKey: (env.DSH_OSD_KEY ?? cfg.osdKey ?? `dsh-${process.pid}`).trim(),

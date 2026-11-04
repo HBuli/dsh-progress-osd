@@ -79,7 +79,7 @@ dsh plugin --profile web remove dsh-osd-progress
 | `notifyLive` / `DSH_OSD_NOTIFY_LIVE` | `false` | 运行中也弹 toast |
 | `sound` / `DSH_OSD_SOUND` | `true` | 一轮结束播放提示音 |
 | `soundFile` / `DSH_OSD_SOUND_FILE` | `complete.oga` | 提示音文件 |
-| `doneHoldMs` / `DSH_OSD_DONE_HOLD_MS` | `3000` | 完成态停留多久后收回顶栏 |
+| `doneHoldMs` / `DSH_OSD_DONE_HOLD_MS` | `7000` | 完成态停留多久后收回顶栏 |
 | `fallbackToText` | `true` | 无 reasoning 时回退正文 |
 | `showCost` / `DSH_OSD_SHOW_COST` | `true` | 收尾时把本轮花费拼进完成提示 |
 | `costLedgerFile` / `DSH_OSD_COST_LEDGER` | `$DSH_HOME/storages/cost-meter/ledger.json` | 花费账本（dsh-cost-meter 写的） |
