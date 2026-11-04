@@ -1,0 +1,14 @@
+# dsh-progress-osd：作为一层 profile bundle 插入。
+# 只注册 host 侧 loader 条目，没有浏览器（client）半边。
+#
+# config 会原样传给 apply(ctx, config)；这里留空的键用插件默认值。
+# 环境变量优先于本文件（见 README）。
+- insert:
+    - id: progress-osd
+      name: 'dsh-progress-osd'
+      config:
+        model: deepseek-chat
+        debounceMs: 5000
+        maxChars: 30
+        notify: true
+        notifyLive: false
