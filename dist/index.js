@@ -251,11 +251,61 @@ function resolveConfig(config, logger) {
         osdFile: (env.DSH_OSD_FILE ?? cfg.osdFile ?? path.join(os.homedir(), ".cache", "dsh-osd.json")).trim(),
         osdKey: (env.DSH_OSD_KEY ?? cfg.osdKey ?? `dsh-${process.pid}`).trim(),
         title: (env.DSH_OSD_TITLE ?? cfg.title ?? APP_NAME).trim() || APP_NAME,
+        showCost: envFlag(env.DSH_OSD_SHOW_COST, cfg.showCost ?? true),
+        costLedgerFile: (env.DSH_OSD_COST_LEDGER
+            ?? cfg.costLedgerFile
+            ?? path.join(env.DSH_HOME ?? path.join(os.homedir(), ".dsh"), "storages", "cost-meter", "ledger.json")).trim(),
+        costCurrency: (env.DSH_OSD_COST_CURRENCY ?? cfg.costCurrency ?? "CNY") === "USD" ? "USD" : "CNY",
     };
     if (resolved.maxChars !== DEFAULT_MAX_CHARS) {
         logger?.info?.(`dsh-progress-osd: 文本上限 ${resolved.maxChars > 0 ? `${resolved.maxChars} 字` : "不截断"}`);
     }
     return resolved;
+}
+/* ------------------------------------------------------------------ *
+ * 花费：读 dsh-cost-meter 的账本（只读，不联网）
+ *
+ * 账本结构（~/.dsh/storages/cost-meter/ledger.json）：
+ *   { days: { "2026-11-05": { costCny, sessions: [
+ *       { id: "session-xxx" | "xxx", costCny, cost, at, byProviderModel } ] } } }
+ * 同一会话会按天、按调用出现多条记录，所以要按 id 累加；
+ * 而且 id 有两种写法（带 / 不带 `session-` 前缀），比对前统一归一化。
+ * ------------------------------------------------------------------ */
+function normalizeSessionId(id) {
+    return id.replace(/^session-/, "");
+}
+export async function readSessionCost(file, sessionId, currency) {
+    try {
+        const raw = await fs.promises.readFile(file, "utf8");
+        const parsed = JSON.parse(raw);
+        const target = normalizeSessionId(sessionId);
+        const field = currency === "USD" ? "cost" : "costCny";
+        let total = 0;
+        let found = false;
+        for (const day of Object.values(parsed.days ?? {})) {
+            const list = Array.isArray(day?.sessions) ? day.sessions : [];
+            for (const item of list) {
+                const id = typeof item?.id === "string" ? normalizeSessionId(item.id) : "";
+                if (id !== target)
+                    continue;
+                const value = item?.[field];
+                if (typeof value === "number" && Number.isFinite(value)) {
+                    total += value;
+                    found = true;
+                }
+            }
+        }
+        return found ? total : null;
+    }
+    catch {
+        return null;
+    }
+}
+/** 顶栏空间小：一毛以下给 4 位小数（¥0.0031），以上给 2 位（¥1.23） */
+export function formatCost(value, currency = "CNY") {
+    const symbol = currency === "USD" ? "$" : "¥";
+    const digits = value > 0 && value < 0.1 ? 4 : 2;
+    return `${symbol}${value.toFixed(digits)}`;
 }
 /* ------------------------------------------------------------------ *
  * 插件主体
@@ -269,6 +319,8 @@ export function apply(ctx, config) {
     let thoughtTimer = null;
     let osdTimer = null;
     let doneTimer = null;
+    // 本轮开始时该会话的累计花费（元），用来做差得到「本轮花了多少」
+    let turnBaselineCost = null;
     let lastOsdWrite = 0;
     let lastOsdLabel = "";
     let lastOsdCommand = "";
@@ -531,6 +583,41 @@ export function apply(ctx, config) {
         }, cfg.doneHoldMs);
         doneTimer.unref?.();
     }
+    /**
+     * 一轮结束后把花费补进完成提示。
+     * 账本是 cost-meter 在每次 API 调用后写的，turn/end 当下可能还没落盘，
+     * 所以等 1.2 秒再读一次；读不到就什么都不改（顶栏只显示「任务已完成」）。
+     */
+    function attachCost(sessionId) {
+        if (!cfg.showCost)
+            return;
+        const startedAt = Date.now();
+        const delay = Math.min(1200, Math.max(0, cfg.doneHoldMs - 1200));
+        const timer = setTimeout(() => {
+            void (async () => {
+                try {
+                    const total = await readSessionCost(cfg.costLedgerFile, sessionId, cfg.costCurrency);
+                    if (total == null)
+                        return;
+                    const base = turnBaselineCost;
+                    const spent = base != null ? Math.max(0, total - base) : total;
+                    if (!(spent > 0))
+                        return;
+                    // 停留时间快过了就别再写，免得把已删除的 key 又写回来
+                    if (Date.now() - startedAt > Math.max(500, cfg.doneHoldMs - 400))
+                        return;
+                    const snapshot = sessions.get(sessionId);
+                    if (!snapshot?.done)
+                        return;
+                    pushOsd({ label: "任务已完成", command: formatCost(spent, cfg.costCurrency), done: true }, false);
+                }
+                catch (error) {
+                    logger?.warn?.(`dsh-progress-osd: 读取花费失败: ${error?.message ?? String(error)}`);
+                }
+            })();
+        }, delay);
+        timer.unref?.();
+    }
     /* ---------------- 事件 ---------------- */
     /**
      * 从 assistant/message、assistant/attempt 的 stream 里取思考文本。
@@ -592,6 +679,14 @@ export function apply(ctx, config) {
                 if (thoughtTimer) {
                     clearTimeout(thoughtTimer);
                     thoughtTimer = null;
+                }
+                turnBaselineCost = null;
+                if (cfg.showCost) {
+                    const id = sessionId;
+                    void readSessionCost(cfg.costLedgerFile, id, cfg.costCurrency).then((value) => {
+                        if (activeSessionId === id)
+                            turnBaselineCost = value;
+                    });
                 }
                 pushOsd({ label: "思考中", command: "", done: false }, true);
                 return;
@@ -656,6 +751,7 @@ export function apply(ctx, config) {
                 // 收尾文本：优先用本段最后的思考，其次本地规则兜底（都不联网）
                 const finalText = snapshot.thought || fallbackSummary(snapshot, "done");
                 publishDone(snapshot, finalText);
+                attachCost(sessionId);
                 return;
             }
         }

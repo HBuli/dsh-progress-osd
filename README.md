@@ -81,6 +81,9 @@ dsh plugin --profile web remove dsh-osd-progress
 | `soundFile` / `DSH_OSD_SOUND_FILE` | `complete.oga` | 提示音文件 |
 | `doneHoldMs` / `DSH_OSD_DONE_HOLD_MS` | `3000` | 完成态停留多久后收回顶栏 |
 | `fallbackToText` | `true` | 无 reasoning 时回退正文 |
+| `showCost` / `DSH_OSD_SHOW_COST` | `true` | 收尾时把本轮花费拼进完成提示 |
+| `costLedgerFile` / `DSH_OSD_COST_LEDGER` | `$DSH_HOME/storages/cost-meter/ledger.json` | 花费账本（dsh-cost-meter 写的） |
+| `costCurrency` / `DSH_OSD_COST_CURRENCY` | `CNY` | `CNY` 读 `costCny`，`USD` 读 `cost` |
 | `osdKey` / `DSH_OSD_KEY` | `dsh-<pid>` | OSD 任务 id |
 | `osdFile` / `DSH_OSD_FILE` | `~/.cache/dsh-osd.json` | OSD 状态文件 |
 | `title` / `DSH_OSD_TITLE` | `DSH 思考` | toast 标题 |
@@ -89,8 +92,18 @@ dsh plugin --profile web remove dsh-osd-progress
 
 - `label`：`思考中` / `执行中` / `任务已完成`，固定宽度不滚动
 - `command`：思考清洗后的单行文本，走跑马灯
-- `done: true` 时界面忽略 command，固定显示「任务已完成」并变绿；**停留 `doneHoldMs` 后删 key**（删 key 才是归还位置的唯一方式）
+- `done: true` 时界面固定显示「任务已完成」并变绿；若此时 `command` 非空，会拼成 `任务已完成 · ¥0.0313`（插件用它带本轮花费）；**停留 `doneHoldMs` 后删 key**（删 key 才是归还位置的唯一方式）
 - 写入是原子的（`.tmp` + rename，QML 每 500ms `cat` 一次），300ms 节流
+
+## 5.1 完成提示带上本轮花费
+
+插件只读本机的花费账本，不调用任何费用接口：
+
+1. `turn/start`：读账本里**该会话的累计花费**当基线（`~/.dsh/storages/cost-meter/ledger.json`）；
+2. `turn/end`：等 1.2 秒（账本由 dsh-cost-meter 在每次 API 调用后异步落盘），再读一次累计值；
+3. 差值是本轮花费，写成 `command`（`done: true` 期间）→ 顶栏显示 `任务已完成 · ¥0.0313`。
+
+账本里的会话 id 有两种写法（`session-<uuid>` 和裸 `<uuid>`），比对前会归一化；同一天同一会话可能有多条记录，按 id 累加。读不到账本、会话不在账本里、或差值为 0 时，只显示「任务已完成」，不报错。
 
 ## 6. 容错
 
