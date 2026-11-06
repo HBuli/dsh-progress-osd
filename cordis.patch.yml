@@ -10,7 +10,7 @@
         # 思考停顿多久才推（毫秒）：每来一段新思考都会重置计时器
         thoughtDebounceMs: 4000
         # 文本上限：只取思考的第一行，60 字兜底（0 表示完全不截断）
-        maxChars: 60
+        maxChars: 150
         # 不弹系统 toast：进度只在顶栏 OSD 显示，收尾用提示音提醒
         notify: false
         notifyLive: false

@@ -38,7 +38,7 @@ export const inject = [];
 const APP_NAME = "DSH 思考";
 const ICON = "utilities-terminal";
 // 顶栏是跑马灯，长句能自己滚，所以上限放宽到 400；0 = 不截断
-const DEFAULT_MAX_CHARS = 60;
+const DEFAULT_MAX_CHARS = 150;
 /* ------------------------------------------------------------------ *
  * 小工具
  * ------------------------------------------------------------------ */

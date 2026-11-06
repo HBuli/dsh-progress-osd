@@ -40,7 +40,7 @@ export const inject: string[] = [];
 const APP_NAME = "DSH 思考";
 const ICON = "utilities-terminal";
 // 顶栏是跑马灯，长句能自己滚，所以上限放宽到 400；0 = 不截断
-const DEFAULT_MAX_CHARS = 60;
+const DEFAULT_MAX_CHARS = 150;
 
 /* ------------------------------------------------------------------ *
  * 类型（自包含，不 import DSH 内部类型包：link 进 profile 后解析不到）
